@@ -1,0 +1,38 @@
+{
+  "version": 1,
+  "componentId": "onym:component:onym-courier",
+  "seat": "transport.message",
+  "operator": "onym:key:REPLACE-COURIER-KEY",
+  "messageProfileId": "onym:message-profile:opaque-topic-inbox-v1",
+  "implementationProfileId": "onym:message-implementation:nostr-courier-v1",
+  "endpoints": [
+    {
+      "uri": "wss://nostr.onym.app",
+      "role": "read-write"
+    }
+  ],
+  "capabilities": [
+    "topic",
+    "inbox"
+  ],
+  "limits": {
+    "maximumEventBytes": 131072,
+    "maximumConcurrentSubscriptions": 64
+  },
+  "retention": {
+    "class": "best-effort",
+    "maximum": "P30D"
+  },
+  "privacyProfile": "https://discovery.onym.app/privacy.md",
+  "offers": [
+    {
+      "offerId": "courier-free-v1",
+      "model": "free",
+      "service": {
+        "reads": "unlimited",
+        "writes": "unlimited"
+      }
+    }
+  ],
+  "validUntil": "2027-08-13T00:00:00Z"
+}

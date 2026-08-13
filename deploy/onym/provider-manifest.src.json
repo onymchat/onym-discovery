@@ -1,0 +1,30 @@
+{
+  "version": 1,
+  "implementationProfile": "onym:discovery-implementation:static-ed25519-v1",
+  "providerId": "onym:component:onym-discovery",
+  "operator": "onym:key:REPLACE-OPERATOR-KEY",
+  "seat": "discovery",
+  "catalogs": [
+    {
+      "catalogId": "onym-services",
+      "snapshot": "https://discovery.onym.app/catalogs/onym-services.json",
+      "audience": "public",
+      "seatTypes": [
+        "moderation",
+        "notary",
+        "transport.message",
+        "blob.storage"
+      ],
+      "policy": "sha256:REPLACE-POLICY-DIGEST",
+      "policyUri": "https://discovery.onym.app/policies/onym-services.md"
+    }
+  ],
+  "capabilities": [
+    "signed-snapshot-v1",
+    "local-filtering-v1"
+  ],
+  "privacyProfile": "sha256:REPLACE-PRIVACY-DIGEST",
+  "privacyProfileUri": "https://discovery.onym.app/privacy.md",
+  "offers": [],
+  "validUntil": "2027-08-13T00:00:00Z"
+}

@@ -1,0 +1,68 @@
+{
+  "catalogId": "onym-services",
+  "providerId": "onym:component:onym-discovery",
+  "policyDigest": "sha256:REPLACE-POLICY-DIGEST",
+  "expiryDays": 30,
+  "entries": [
+    {
+      "componentId": "onym:component:onym-authority",
+      "seatType": "moderation",
+      "manifest": {
+        "uri": "https://moderation.onym.app/manifest.json"
+      },
+      "manifestFile": "../reviewed/onym-authority.json",
+      "operator": "onym:key:REPLACE-AUTHORITY-KEY",
+      "profiles": [
+        "onym:moderation-profile:consent-bound-v1"
+      ],
+      "listedAt": "2026-08-13T00:00:00Z",
+      "relationship": "common-owner",
+      "placement": "policy-ranked"
+    },
+    {
+      "componentId": "onym:component:onym-relayer",
+      "seatType": "notary",
+      "manifest": {
+        "uri": "https://relayer.onym.app/manifest.json"
+      },
+      "manifestFile": "../reviewed/onym-relayer.json",
+      "operator": "onym:key:REPLACE-RELAYER-KEY",
+      "profiles": [
+        "onym:notary-implementation:stellar-soroban-sep-plonk-v1"
+      ],
+      "listedAt": "2026-08-13T00:00:00Z",
+      "relationship": "common-owner",
+      "placement": "policy-ranked"
+    },
+    {
+      "componentId": "onym:component:onym-courier",
+      "seatType": "transport.message",
+      "manifest": {
+        "uri": "https://discovery.onym.app/manifests/onym-courier.json"
+      },
+      "manifestFile": "../out/manifests/onym-courier.json",
+      "operator": "onym:key:REPLACE-COURIER-KEY",
+      "profiles": [
+        "onym:message-implementation:nostr-courier-v1"
+      ],
+      "listedAt": "2026-08-13T00:00:00Z",
+      "relationship": "common-owner",
+      "placement": "policy-ranked"
+    },
+    {
+      "componentId": "onym:component:onym-blossom",
+      "seatType": "blob.storage",
+      "manifest": {
+        "uri": "https://discovery.onym.app/manifests/onym-blossom.json"
+      },
+      "manifestFile": "../out/manifests/onym-blossom.json",
+      "operator": "onym:key:REPLACE-BLOSSOM-KEY",
+      "profiles": [
+        "onym:blob-implementation:blossom-v1"
+      ],
+      "listedAt": "2026-08-13T00:00:00Z",
+      "relationship": "common-owner",
+      "placement": "policy-ranked"
+    }
+  ]
+}

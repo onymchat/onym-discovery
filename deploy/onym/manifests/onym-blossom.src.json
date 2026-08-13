@@ -1,0 +1,35 @@
+{
+  "version": 1,
+  "componentId": "onym:component:onym-blossom",
+  "seat": "blob.storage",
+  "operator": "onym:key:REPLACE-BLOSSOM-KEY",
+  "implementationProfileId": "onym:blob-implementation:blossom-v1",
+  "endpoints": [
+    {
+      "uri": "https://blossom.onym.app",
+      "role": "read-write"
+    }
+  ],
+  "capabilities": [
+    "upload",
+    "download"
+  ],
+  "limits": {
+    "maximumBlobBytes": 4194304
+  },
+  "retention": {
+    "class": "best-effort",
+    "maximum": "P90D"
+  },
+  "privacyProfile": "https://discovery.onym.app/privacy.md",
+  "offers": [
+    {
+      "offerId": "blossom-free-v1",
+      "model": "free",
+      "service": {
+        "uploads": "fair-use"
+      }
+    }
+  ],
+  "validUntil": "2027-08-13T00:00:00Z"
+}
