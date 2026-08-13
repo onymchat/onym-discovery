@@ -1,0 +1,25 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Format
+        run: cargo fmt --check
+      - name: Test (includes fixture byte-comparison)
+        run: cargo test
+      - name: CLI smoke test
+        run: |
+          set -euo pipefail
+          cargo build --release
+          BIN=target/release/onym-discovery
+          TMP=$(mktemp -d)
+          $BIN keygen --out "$TMP/operator.seed"
+          $BIN fingerprint --seed "$TMP/operator.seed"
