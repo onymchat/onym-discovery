@@ -5,6 +5,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use time::OffsetDateTime;
 
+use crate::canonical::reject_duplicate_keys;
 use crate::error::Error;
 use crate::sign::sign_document;
 use crate::types::*;
@@ -25,6 +26,7 @@ pub struct SnapshotConfig {
     pub entries: Vec<Value>,
 }
 
+#[derive(Debug)]
 pub struct BuiltSnapshot {
     pub bytes: Vec<u8>,
     pub sequence: u64,
@@ -48,6 +50,12 @@ pub fn build_snapshot(
     let (sequence, previous_digest) = match previous_raw {
         None => (1u64, None),
         Some(bytes) => {
+            // §3: duplicate keys make the document invalid — checked
+            // BEFORE the tree parse, whose last-key-wins decoding was
+            // the residual last-wins path: the builder derives the new
+            // `sequence` and `previousDigest` from these bytes.
+            reject_duplicate_keys(bytes)
+                .map_err(|e| Error::Malformed(format!("previous snapshot: {e}")))?;
             let previous: CatalogSnapshot = serde_json::from_slice(bytes)
                 .map_err(|e| Error::Malformed(format!("previous snapshot: {e}")))?;
             if previous.catalog_id != config.catalog_id {
@@ -128,6 +136,29 @@ fn resolve_entry(raw_entry: &Value, config_dir: &std::path::Path) -> Result<Valu
             "unknown relationship {}",
             decoded.relationship
         )));
+    }
+    if !PLACEMENTS.contains(&decoded.placement.as_str()) {
+        return Err(Error::Malformed(format!(
+            "unknown placement {}",
+            decoded.placement
+        )));
+    }
+    // §4.2: evidence must be absent or empty in v1; status, when
+    // present, must be a renderable warning/review state. A builder
+    // must not emit entries a conforming verifier would skip.
+    if !decoded.evidence.is_empty() {
+        return Err(Error::Malformed("evidence must be empty in v1".into()));
+    }
+    if let Some(status) = &decoded.status {
+        if !STATUS_STATES.contains(&status.state.as_str()) {
+            return Err(Error::Malformed(format!(
+                "unknown status state {}",
+                status.state
+            )));
+        }
+        if let Some(uri) = &status.uri {
+            validate_uri(uri)?;
+        }
     }
     // Re-serialize through the typed struct so field order and shape
     // are deterministic regardless of config formatting.

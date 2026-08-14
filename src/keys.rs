@@ -43,19 +43,24 @@ pub fn sign(key: &SigningKey, message: &[u8]) -> String {
     base64::engine::general_purpose::STANDARD.encode(key.sign(message).to_bytes())
 }
 
-pub fn verify(key_bytes: &[u8; 32], message: &[u8], signature_b64: &str) -> Result<(), Error> {
+/// Decode a base64 Ed25519 signature (padded or unpadded accepted on
+/// read, §3) into its 64 raw bytes.
+pub fn decode_signature_b64(signature_b64: &str) -> Result<[u8; 64], Error> {
     use base64::Engine as _;
-    let key = VerifyingKey::from_bytes(key_bytes)
-        .map_err(|e| Error::Malformed(format!("public key: {e}")))?;
     let engine = base64::engine::general_purpose::STANDARD;
     let no_pad = base64::engine::general_purpose::STANDARD_NO_PAD;
     let raw = engine
         .decode(signature_b64)
         .or_else(|_| no_pad.decode(signature_b64))
         .map_err(|e| Error::Malformed(format!("signature base64: {e}")))?;
-    let sig_bytes: [u8; 64] = raw
-        .try_into()
-        .map_err(|_| Error::Malformed("signature must be 64 bytes".into()))?;
+    raw.try_into()
+        .map_err(|_| Error::Malformed("signature must be 64 bytes".into()))
+}
+
+pub fn verify(key_bytes: &[u8; 32], message: &[u8], signature_b64: &str) -> Result<(), Error> {
+    let key = VerifyingKey::from_bytes(key_bytes)
+        .map_err(|e| Error::Malformed(format!("public key: {e}")))?;
+    let sig_bytes = decode_signature_b64(signature_b64)?;
     let signature = ed25519_dalek::Signature::from_bytes(&sig_bytes);
     key.verify(message, &signature)
         .map_err(|_| Error::Malformed("signature verification failed".into()))

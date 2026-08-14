@@ -77,9 +77,17 @@ same content + key always produces the same file and the same digest.
 
 `tests/fixtures/` holds the deterministic vectors listed in the profile's
 §10 — a signed manifest, a three-snapshot chain, a destination manifest,
-and canonicalization vectors. CI regenerates and byte-compares them on
-every push, so implementation drift fails the build. Client repos (the
-iOS `OnymDiscovery` package) consume these exact files.
+canonicalization vectors (including the case-divergence and escaping
+sub-vectors), a sponsored-placement + disclosed-status snapshot, a
+source-conflict provider pair, a policy-transition manifest, an
+audience-skip manifest, cross-catalog equivocation snapshots, a
+duplicate-key rejection vector, and a detached-`.sig` disagreement pair.
+The forward-jump and no-op-refresh cases are exercised as tests over the
+chain fixtures. §10 item 9 (the privacy fetch trace) is a client
+network-behavior obligation, not an offline byte fixture. CI regenerates
+and byte-compares fixtures on every push, so implementation drift fails
+the build. Client repos (the iOS and Android discovery packages) consume
+these exact files.
 
 Regenerate deliberately after an intentional change:
 
@@ -90,21 +98,39 @@ DISCOVERY_REGEN_FIXTURES=1 cargo test --test conformance
 ## What verification enforces
 
 - Ed25519 signatures over canonical bytes (structural signature removal,
-  key-sorted compact JSON, unescaped `/` — the same mechanism as
-  `onym-moderation`'s canonical.rs, pinned by fixtures not shared code);
-- strict top-level schemas, lossy per-entry decoding;
-- sequence +1 chains with `previousDigest` over exact published bytes —
-  rollback, gaps, and forks are named failures;
-- ≤ 90-day expiry windows, and expiry evaluated at verify time;
+  UTF-8-byte-order key sorting, compact JSON, unescaped `/`, pinned
+  string escaping — the same mechanism as `onym-moderation`'s
+  canonical.rs, pinned by fixtures not shared code);
+- duplicate JSON keys rejected at any depth (a streaming scan before the
+  tree parse — never last-key-wins);
+- strict top-level schemas, lossy per-entry and per-descriptor decoding
+  with surfaced skip counts; non-public catalogs skipped by `audience`;
+  `seatTypes` member validation; entry `status` decoded and surfaced
+  (never skipped when valid); non-empty `evidence` skips the entry;
+- the §6 four-case chain comparison against retained per-catalog state:
+  no-op refresh (no warning), rollback and forks rejected, forward
+  jumps accepted with a source-integrity note; first acceptance of a
+  source takes any sequence (TOFU covers trust);
+- the §4.2 one-generation policy-transition grace, surfaced as a note;
+- ≤ 90-day expiry windows, expiry and future-dating evaluated with the
+  symmetric 10-minute skew allowance;
 - profile §7 bounds and URI rules (https-only, DNS hosts, no IP
-  literals, no query/fragment/userinfo/port);
+  literals including integer forms, no query/fragment/userinfo, and no
+  port component in the RAW string — a redundant `:443` is rejected
+  before URL-library normalization can hide it);
 - destination manifests bound by pinned digest — drifted bytes are
-  `entry_manifest_mismatch`, never silently refreshed.
+  `entry_manifest_mismatch`, oversize is `entry_manifest_unavailable`,
+  never silently refreshed;
+- detached-`.sig` agreement (compared after base64 decoding) with a
+  verify path that fails closed on disagreement;
+- cross-catalog digest equivocation and two-source `source_conflict`
+  detection helpers, consumed by the fixtures.
 
-Known limitation: duplicate JSON keys are not detected (serde_json keeps
-the last occurrence). The canonical form a signer emits never contains
-duplicates; a verifier that must treat duplicate-key documents as
-invalid needs a stricter parse pass than this reference currently does.
+Known limitations: the §6 intermediate-fetch continuity walk over
+retained `<catalogId>-<sequence>.json` siblings is a fetch-side
+behavior this offline CLI does not perform (forward jumps degrade to
+accept-with-note, which §6 permits); the builder does publish the §5
+retention siblings.
 
 ## License
 

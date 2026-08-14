@@ -85,27 +85,37 @@ pub struct CatalogEntry {
     pub operator: String,
     #[serde(default)]
     pub profiles: Vec<String>,
+    /// §4.2: must be absent or the empty array in v1; a non-empty
+    /// `evidence` skips the entry (unrenderable attestations are the
+    /// audit-laundering the abstract §13 forbids presenting).
     #[serde(default)]
-    pub evidence: Vec<EvidenceRef>,
+    pub evidence: Vec<serde_json::Value>,
     pub listed_at: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reviewed_at: Option<String>,
     pub relationship: String,
     pub placement: String,
+    /// §4.2 disclosed warning/review status — defined in v1 so that
+    /// entry-lossy decoding cannot silently drop the very entries
+    /// carrying warnings. An undecodable `status` skips the entry.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status: Option<EntryStatus>,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct EntryStatus {
+    pub state: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub uri: Option<String>,
+}
+
+/// Accepted `status.state` values (§4.2).
+pub const STATUS_STATES: &[&str] = &["warning", "review"];
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct ManifestRef {
-    pub uri: String,
-    pub digest: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields, rename_all = "camelCase")]
-pub struct EvidenceRef {
-    #[serde(rename = "type")]
-    pub kind: String,
     pub uri: String,
     pub digest: String,
 }
@@ -119,6 +129,14 @@ pub const RELATIONSHIPS: &[&str] = &[
     "catalog-sponsor",
     "other-disclosed",
 ];
+
+/// Accepted `placement` values, pinned like [`RELATIONSHIPS`] and
+/// failing closed the same way (§4.2: an undecodable `placement` skips
+/// the entry — a commercial disclosure the client cannot render is a
+/// disclosure the user never saw). The values are the ones the
+/// abstract contract's §5.3 example and this profile's fixtures use;
+/// admitting a new one is a profile version bump, not a soft addition.
+pub const PLACEMENTS: &[&str] = &["policy-ranked", "sponsored"];
 
 /// `onym:key:<64 lowercase hex>` → 32 raw public-key bytes.
 pub fn parse_operator_key(value: &str) -> Result<[u8; 32], Error> {
@@ -155,6 +173,26 @@ pub fn validate_component_id(value: &str) -> Result<(), Error> {
     {
         return Err(Error::Malformed(format!(
             "invalid component token: {token}"
+        )));
+    }
+    Ok(())
+}
+
+/// §4.1 `seatTypes` member: a token in `[a-z0-9.-]{1,64}` or the
+/// literal `"*"` wildcard (which must appear alone — enforced by the
+/// caller over the whole array).
+pub fn validate_seat_type_member(value: &str) -> Result<(), Error> {
+    if value == "*" {
+        return Ok(());
+    }
+    if value.is_empty()
+        || value.len() > 64
+        || !value
+            .bytes()
+            .all(|b| matches!(b, b'a'..=b'z' | b'0'..=b'9' | b'.' | b'-'))
+    {
+        return Err(Error::Malformed(format!(
+            "invalid seatTypes member: {value}"
         )));
     }
     Ok(())
@@ -216,6 +254,32 @@ pub fn validate_uri(value: &str) -> Result<(), Error> {
     if url.port().is_some() {
         return Err(Error::Malformed(format!(
             "{value}: explicit port not allowed"
+        )));
+    }
+    // §7: the port check runs over the RAW string, not only the parsed
+    // port — URL libraries normalize a redundant `:443` away before a
+    // parsed-port check is reachable, and a verifier relying only on
+    // the parsed port does not conform.
+    let authority_start = value
+        .find("://")
+        .map(|i| i + 3)
+        .ok_or_else(|| Error::Malformed(format!("{value}: no authority")))?;
+    let authority_end = value[authority_start..]
+        .find(['/', '?', '#'])
+        .map(|i| authority_start + i)
+        .unwrap_or(value.len());
+    let authority = &value[authority_start..authority_end];
+    // §7: no userinfo — enforced over the RAW authority too, because
+    // an EMPTY userinfo (`https://@host/x`) parses to an empty
+    // username and slips past the parsed-userinfo check above.
+    if authority.contains('@') {
+        return Err(Error::Malformed(format!(
+            "{value}: userinfo component in raw URI string not allowed"
+        )));
+    }
+    if authority.contains(':') {
+        return Err(Error::Malformed(format!(
+            "{value}: port component in raw URI string not allowed"
         )));
     }
     Ok(())
