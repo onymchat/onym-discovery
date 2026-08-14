@@ -51,6 +51,25 @@ if grep -qE "$SITE_ADDR_RE" "$CADDYFILE"; then
     exit 0
 fi
 
+# The compose override is only ours to write when it is absent or when
+# it carries our managed header. Anything else — hand-written on the
+# box, or owned by another deploy — must NEVER be overwritten, and must
+# be refused BEFORE the backup is taken, so a backup can never capture
+# (and a rollback never "restore") a clobbered copy of someone else's
+# file.
+MANAGED_HEADER="# managed by onym-discovery deploy"
+if [ -f "$OVERRIDE" ] && ! grep -qiF "$MANAGED_HEADER" "$OVERRIDE"; then
+    die "$OVERRIDE exists but does not carry the managed header
+  ('$MANAGED_HEADER'), so it is owned by something else and this script
+  will not touch it. To proceed, merge these two mounts into the caddy
+  service of that file yourself:
+      - $WEB_ROOT:/srv/discovery:ro
+      - ./caddy.d:/etc/caddy/caddy.d:ro
+  then add the managed header as its first line ONLY if you want this
+  deploy to take ownership (re-deploys will rewrite the whole file), or
+  leave it unmanaged and keep the mounts in sync by hand."
+fi
+
 BACKUP="$(mktemp -d)"
 cp -p "$CADDYFILE" "$BACKUP/Caddyfile"
 [ ! -f "$SNIPPET" ]  || cp -p "$SNIPPET"  "$BACKUP/discovery.caddy"
@@ -136,6 +155,13 @@ cd "$INFRA_DIR"
 # Validate the merged config in a throwaway container BEFORE touching
 # the running one: every other onym.app vhost rides on this Caddy, and a
 # bad snippet must fail here, not take the stack down.
+#
+# This works because onym-infra BIND-MOUNTS the Caddyfile into the stock
+# image — onym-infra/docker-compose.yml, caddy service:
+#   `- ./Caddyfile:/etc/caddy/Caddyfile:ro`
+# (image `caddy:2-alpine`, nothing baked in) — and our override above
+# bind-mounts caddy.d the same way, so the throwaway `compose run`
+# container sees exactly the effective config the running one will load.
 info "validating Caddy config..."
 if ! docker compose run --rm --no-deps -T caddy \
         caddy validate --config /etc/caddy/Caddyfile; then
@@ -145,9 +171,29 @@ fi
 
 # `up -d` recreates the container when the override changed (new
 # mounts); the explicit reload covers the remaining case where only the
-# bind-mounted snippet bytes changed and compose sees no diff.
+# bind-mounted snippet bytes changed and compose sees no diff. If the
+# container WAS just recreated it may still be starting, so the reload
+# can race its admin socket — retry with a short backoff instead of
+# failing the deploy on a race. The config already passed validation, so
+# a persistent reload failure is an environment problem: roll the files
+# back (and best-effort reload the restored config) rather than leave
+# on-disk state that the running Caddy never accepted.
 info "applying (recreate if mounts changed, then reload)..."
 docker compose up -d caddy
-docker compose exec -T caddy caddy reload --config /etc/caddy/Caddyfile
+reloaded=false
+for attempt in 1 2 3 4 5; do
+    if docker compose exec -T caddy caddy reload --config /etc/caddy/Caddyfile; then
+        reloaded=true
+        break
+    fi
+    [ "$attempt" -eq 5 ] || { info "  reload attempt $attempt failed — retrying in 2s..."; sleep 2; }
+done
+if [ "$reloaded" != "true" ]; then
+    rollback
+    docker compose exec -T caddy caddy reload --config /etc/caddy/Caddyfile || true
+    die "caddy reload failed after 5 attempts — rolled back the vhost files
+  and re-issued a reload of the restored config. Inspect the container:
+  cd $INFRA_DIR && docker compose logs caddy | tail -50"
+fi
 
 info "Caddy vhost for $HOST ensured (root $WEB_ROOT)"

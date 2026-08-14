@@ -1,3 +1,5 @@
 reviewed/*.json
+# CI-built signing output — scratch, never committed. Pre-signed
+# artifacts for skip_signing deploys are committed under signed/ instead.
 out/
 previous.json

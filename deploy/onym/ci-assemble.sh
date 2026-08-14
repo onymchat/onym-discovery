@@ -9,10 +9,11 @@
 #   false  (default) Sign in CI. The three operator seeds arrive in env —
 #          DISCOVERY_OPERATOR_SEED, COURIER_OPERATOR_SEED,
 #          BLOSSOM_OPERATOR_SEED, 64 hex chars each — and everything under
-#          deploy/onym/out/ is produced fresh on the runner.
-#   true   Deploy the pre-signed artifacts already committed under
-#          deploy/onym/out/ (signed locally per the README runbook). No
-#          seed ever reaches CI in this mode.
+#          deploy/onym/out/ is produced fresh on the runner (out/ is
+#          gitignored scratch, never committed).
+#   true   Deploy the pre-signed artifacts COMMITTED under
+#          deploy/onym/signed/ (signed locally per the README runbook).
+#          No seed ever reaches CI in this mode.
 #
 # Either way, every artifact is verified exactly as a client would verify
 # it before a byte leaves the runner, and the assembled tree lands in
@@ -21,18 +22,24 @@
 # Environment:
 #   SERVE_DIR        where to assemble the served tree (default deploy/onym/serve)
 #   DISCOVERY_HOST   public hostname (default discovery.onym.app)
-#   SKIP_SIGNING     "true" to use committed deploy/onym/out/ artifacts
+#   SKIP_SIGNING     "true" to use committed deploy/onym/signed/ artifacts
 #   GENESIS          "true" only for the very first publish (sequence 1);
 #                    any build that would start a new chain aborts without it
 #   CF_API_TOKEN     optional; lets the genesis guard cross-check Cloudflare
 #   DOMAIN           Cloudflare zone for that cross-check (default onym.app)
+#   DROPLET_IP       optional; the target droplet's public IP. Enables the
+#                    genesis RECOVERY path: a first deploy that wedged after
+#                    DNS but before the cert leaves the host resolving with
+#                    nothing fetchable, and only an A record that provably
+#                    points at THIS droplet may unwedge it (see below)
 #   *_OPERATOR_SEED  signing seeds (only when SKIP_SIGNING != true)
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 SRC="$SCRIPT_DIR"
-OUT="$SRC/out"
+OUT="$SRC/out"          # CI-built artifacts — gitignored scratch
+SIGNED="$SRC/signed"    # pre-signed, COMMITTED artifacts (skip_signing)
 SERVE_DIR="${SERVE_DIR:-$SRC/serve}"
 WORK="${WORK_DIR:-$(mktemp -d)}"
 # The work dir holds the fetched previous snapshot AND (briefly) the
@@ -42,6 +49,7 @@ DISCOVERY_HOST="${DISCOVERY_HOST:-discovery.onym.app}"
 SKIP_SIGNING="${SKIP_SIGNING:-false}"
 GENESIS="${GENESIS:-false}"
 DOMAIN="${DOMAIN:-onym.app}"
+DROPLET_IP="${DROPLET_IP:-}"
 BIN="$REPO_ROOT/target/release/onym-discovery"
 CONFIG="$SRC/catalogs/onym-services.config.json"
 POLICY="$SRC/policies/onym-services.md"
@@ -133,35 +141,105 @@ fi
 
 # ─── Previous snapshot (the chain) ────────────────────────────────────
 #
-# The snapshot must chain onto the previously PUBLISHED bytes. Only two
-# outcomes may proceed: the live snapshot was fetched (chain onto it),
-# or the operator explicitly declared this the genesis publish
-# (GENESIS=true) and nothing contradicts that. A failed fetch is NEVER
-# taken as evidence that nothing is published — DNS can fail for a host
-# that served a chain yesterday (resolver outage, deleted record,
-# runner egress) — and quietly building a genesis snapshot over an
-# already published chain would fork the sequence. No path guesses.
+# The snapshot must chain onto the previously PUBLISHED bytes. Only
+# these outcomes may proceed: the live snapshot was fetched (chain onto
+# it), or the operator explicitly declared this the genesis publish
+# (GENESIS=true) and the Cloudflare cross-check does not contradict
+# that. A failed fetch is NEVER taken as evidence that nothing is
+# published — DNS can fail for a host that served a chain yesterday
+# (resolver outage, deleted record, runner egress) — and quietly
+# building a genesis snapshot over an already published chain would
+# fork the sequence.
+#
+# With GENESIS=true, EVERY failure path cross-checks Cloudflare:
+#   - host doesn't resolve + no A record        -> clean genesis
+#   - clean HTTP 404 (record absent or ours)    -> clean genesis
+#   - any other failure (TLS, refused, 5xx...)  -> genesis RECOVERY,
+#     eligible only when every A record for the host points at THIS
+#     deploy's droplet (DROPLET_IP) AND no snapshot is fetchable from
+#     that droplet directly — the signature of a first deploy that
+#     wedged between the DNS upsert and cert issuance. Proceeds with a
+#     loud warning; anything less aborts.
+# With GENESIS=false every failure path aborts, full stop.
 
-# cf_a_record_exists — cross-check Cloudflare when DNS resolution fails:
-# an existing A record for the host means a deploy has already run, so
-# the DNS failure is an outage, not "nothing published yet".
-# Returns 0 if the record exists, 1 if it provably does not,
-# 2 if the check itself could not be performed.
-cf_a_record_exists() {
+# cf_a_records — print the content (IP) of each Cloudflare A record for
+# DISCOVERY_HOST, one per line. Returns 0 if records exist, 1 if there
+# provably are none, 2 if the check itself could not be performed.
+cf_a_records() {
     [ -n "${CF_API_TOKEN:-}" ] || return 2
-    local cf="https://api.cloudflare.com/client/v4" zone_id count
+    local cf="https://api.cloudflare.com/client/v4" zone_id ips
     zone_id="$(curl -fsS --connect-timeout 15 "$cf/zones?name=$DOMAIN" \
         -H "Authorization: Bearer $CF_API_TOKEN" 2>/dev/null \
         | python3 -c "import sys,json; r=json.load(sys.stdin)['result']; print(r[0]['id'] if r else '')")" \
         || return 2
     [ -n "$zone_id" ] || return 2
-    count="$(curl -fsS --connect-timeout 15 \
+    ips="$(curl -fsS --connect-timeout 15 \
         "$cf/zones/$zone_id/dns_records?type=A&name=$DISCOVERY_HOST" \
         -H "Authorization: Bearer $CF_API_TOKEN" 2>/dev/null \
-        | python3 -c "import sys,json; print(len(json.load(sys.stdin)['result']))")" \
+        | python3 -c "import sys,json
+for rec in json.load(sys.stdin)['result']:
+    print(rec['content'])")" \
         || return 2
-    [ "$count" -gt 0 ] && return 0
-    return 1
+    [ -n "$ips" ] || return 1
+    printf '%s\n' "$ips"
+}
+
+# genesis_recovery_or_die <why> — the fetch failed in a way that used to
+# be fatal even with GENESIS=true. One situation must stay recoverable:
+# a FIRST deploy that wedged mid-run (DNS record created, vhost or cert
+# never finished) leaves the host resolving to our droplet with nothing
+# fetchable — host resolves, TLS fails — and without this path every
+# genesis retry would abort forever. Eligibility is deliberately strict;
+# any doubt aborts.
+genesis_recovery_or_die() {
+    local why="$1" records cf_rc bad probe probe_rc
+    if [ "$GENESIS" != "true" ]; then
+        die "could not fetch the previous snapshot ($why). Refusing to
+  guess: if a snapshot is already published, building genesis would fork the
+  sequence chain. Retry when $SNAPSHOT_URL is reachable."
+    fi
+    set +e
+    records="$(cf_a_records)"
+    cf_rc=$?
+    set -e
+    [ "$cf_rc" -ne 2 ] || die "genesis=true and the snapshot fetch failed ($why), but the
+  Cloudflare cross-check is unavailable (CF_API_TOKEN unset or the API
+  unreachable), so this run cannot prove the failure is a wedged first
+  deploy rather than an outage of a published chain. Aborting."
+    [ "$cf_rc" -ne 1 ] || die "genesis=true and the snapshot fetch failed ($why), but the host
+  resolved while Cloudflare holds NO A record for it — the resolution came
+  from somewhere this deploy does not control. Aborting rather than guess;
+  investigate where $DISCOVERY_HOST's DNS is actually served."
+    [ -n "$DROPLET_IP" ] || die "genesis=true and the snapshot fetch failed ($why). A Cloudflare
+  A record exists, but DROPLET_IP is not set, so this run cannot prove the
+  record points at this deploy's own droplet. Aborting; set DROPLET_IP (CI
+  resolves it via doctl) to enable the wedged-first-deploy recovery path."
+    bad="$(printf '%s\n' "$records" | grep -vxF "$DROPLET_IP" || true)"
+    [ -z "$bad" ] || die "genesis=true and the snapshot fetch failed ($why), but a Cloudflare
+  A record for $DISCOVERY_HOST points at $bad — not this deploy's droplet
+  ($DROPLET_IP). That host may be serving a published chain. Aborting."
+    # The record is ours. Last check: nothing fetchable from the droplet
+    # itself (TLS unverified — a wedged first deploy has no cert yet). A
+    # 200 here means a chain IS published and only the public path is
+    # broken: abort, never fork.
+    set +e
+    probe="$(curl -ksS --connect-timeout 15 --max-time 30 \
+        --resolve "$DISCOVERY_HOST:443:$DROPLET_IP" \
+        -o /dev/null -w '%{http_code}' "$SNAPSHOT_URL" 2>/dev/null)"
+    probe_rc=$?
+    set -e
+    if [ "$probe_rc" -eq 0 ] && [ "$probe" = "200" ]; then
+        die "genesis=true, but the droplet at $DROPLET_IP serves a snapshot at
+  $SNAPSHOT_URL (probed directly, TLS unverified) — a chain is already
+  published and only the public fetch path is broken ($why). Building
+  genesis would fork it. Fix the public path and re-run without genesis."
+    fi
+    err "WARNING: proceeding as GENESIS RECOVERY. The snapshot fetch failed
+  ($why), but every Cloudflare A record for $DISCOVERY_HOST points at this
+  deploy's own droplet ($DROPLET_IP) and no snapshot is fetchable from that
+  droplet directly — the signature of a FIRST deploy that wedged between
+  the DNS upsert and certificate issuance. Building genesis (sequence 1).
+  If a chain was EVER published on this host, STOP THIS RUN NOW."
 }
 
 PREV="$WORK/previous.json"
@@ -176,33 +254,32 @@ if [ "$rc" -eq 6 ]; then
     # DNS resolution failed. That is NOT proof nothing is published:
     # cross-check the Cloudflare zone before even considering genesis.
     set +e
-    cf_a_record_exists
+    cf_a_records >/dev/null
     cf_rc=$?
     set -e
     if [ "$cf_rc" -eq 0 ]; then
-        die "$DISCOVERY_HOST did not resolve, but Cloudflare still holds an A
-  record for it — a deploy has already run and the resolution failure is an
-  outage (resolver, runner egress, or a mid-flight zone change), not a fresh
-  host. Building genesis now would fork the published sequence chain.
-  Retry when $SNAPSHOT_URL is reachable."
-    fi
-    if [ "$GENESIS" != "true" ]; then
+        # A record exists but the host does not resolve — either an
+        # outage of a published chain, or a wedged first deploy whose
+        # record has not propagated to the resolver yet. Only the strict
+        # recovery check may distinguish them.
+        genesis_recovery_or_die "host does not resolve, yet a Cloudflare A record exists"
+    elif [ "$GENESIS" != "true" ]; then
         die "$DISCOVERY_HOST did not resolve and this run was not declared the
   genesis publish. A DNS failure is not evidence that nothing is published,
   and building genesis over an existing chain would fork the sequence.
   If this truly is the FIRST publish (sequence 1), re-run the workflow with
   genesis=true. Otherwise retry when $SNAPSHOT_URL resolves."
-    fi
-    if [ "$cf_rc" -eq 1 ]; then
+    elif [ "$cf_rc" -eq 1 ]; then
         info "  $DISCOVERY_HOST does not resolve and has no Cloudflare A record; genesis=true — genesis publish (sequence 1)"
     else
         info "  $DISCOVERY_HOST does not resolve (Cloudflare cross-check unavailable); genesis=true — genesis publish (sequence 1)"
     fi
 elif [ "$rc" -ne 0 ]; then
     cat "$WORK/curl.err" >&2 || true
-    die "could not fetch the previous snapshot (curl exit $rc). Refusing to
-  guess: if a snapshot is already published, building genesis would fork the
-  sequence chain. Retry when $SNAPSHOT_URL is reachable."
+    # Host resolved but the fetch failed (TLS handshake, connection
+    # refused, timeout...). With genesis=true this may be a wedged first
+    # deploy — the strict recovery check decides; genesis=false aborts.
+    genesis_recovery_or_die "curl exit $rc"
 elif [ "$status" = "404" ]; then
     if [ "$GENESIS" != "true" ]; then
         die "$SNAPSHOT_URL answers HTTP 404 but this run was not declared the
@@ -210,7 +287,22 @@ elif [ "$status" = "404" ]; then
   the workflow with genesis=true. If a snapshot has ever been published,
   investigate the 404 before deploying — genesis would fork the chain."
     fi
-    info "  no snapshot published yet (HTTP 404); genesis=true — genesis publish (sequence 1)"
+    # Clean 404 + genesis=true is a true genesis — TLS worked, the vhost
+    # answered, no snapshot exists. Still cross-check Cloudflare: an A
+    # record pointing somewhere else means the 404 came from a host this
+    # deploy does not control.
+    set +e
+    records="$(cf_a_records)"
+    cf_rc=$?
+    set -e
+    if [ "$cf_rc" -eq 0 ] && [ -n "$DROPLET_IP" ]; then
+        bad="$(printf '%s\n' "$records" | grep -vxF "$DROPLET_IP" || true)"
+        [ -z "$bad" ] || die "genesis=true and $SNAPSHOT_URL answers 404, but a Cloudflare A
+  record for $DISCOVERY_HOST points at $bad — not this deploy's droplet
+  ($DROPLET_IP). That 404 came from a host this deploy does not control.
+  Aborting rather than guess."
+    fi
+    info "  no snapshot published yet (clean HTTP 404); genesis=true — genesis publish (sequence 1)"
 elif [ "$status" = "200" ]; then
     if [ "$GENESIS" = "true" ]; then
         die "genesis=true, but $SNAPSHOT_URL is live — a chain is already
@@ -226,7 +318,10 @@ elif [ "$status" = "200" ]; then
         err "warning: could not fetch $SNAPSHOT_URL.sig — the previous snapshot's retention sibling will be published without its detached signature"
     fi
 else
-    die "unexpected HTTP $status fetching the previous snapshot; refusing to guess. Retry, or investigate $SNAPSHOT_URL."
+    # Unexpected HTTP status (403, 5xx...). Same rule as every other
+    # failure: genesis=false aborts, genesis=true takes the strict
+    # recovery check.
+    genesis_recovery_or_die "unexpected HTTP $status"
 fi
 
 # ─── Assemble the served tree ─────────────────────────────────────────
@@ -294,7 +389,7 @@ if [ "$SKIP_SIGNING" != "true" ]; then
   printed fingerprint out of band, and add $name as an Actions secret in
   this repository or the org. Alternatively re-run this workflow with
   skip_signing=true to deploy pre-signed artifacts committed under
-  deploy/onym/out/ — see deploy/onym/README.md for the tradeoff."
+  deploy/onym/signed/ — see deploy/onym/README.md for the tradeoff."
         # [[ =~ ]] anchors over the WHOLE value — grep matches per line,
         # so "junk\n<64 hex>\n" would sneak past a piped grep.
         [[ "$value" =~ ^[0-9a-fA-F]{64}$ ]] \
@@ -326,14 +421,19 @@ if [ "$SKIP_SIGNING" != "true" ]; then
 
     rm -rf "$SEEDS"
 else
-    info "skip_signing=true — using pre-signed artifacts from deploy/onym/out/"
+    # Pre-signed artifacts live in the COMMITTED signed/ directory —
+    # out/ is gitignored CI scratch and deliberately stays that way, so
+    # the two modes can never contaminate each other.
+    info "skip_signing=true — using pre-signed artifacts from deploy/onym/signed/"
+    OUT="$SIGNED"
     for f in manifest.json manifest.json.sig \
              catalogs/onym-services.json catalogs/onym-services.json.sig \
              manifests/onym-courier.json manifests/onym-courier.json.sig \
              manifests/onym-blossom.json manifests/onym-blossom.json.sig; do
-        [ -f "$OUT/$f" ] || die "skip_signing=true but deploy/onym/out/$f is missing.
-  Sign locally per the deploy/onym/README.md runbook and commit out/, or
-  re-run without skip_signing to sign in CI."
+        [ -f "$OUT/$f" ] || die "skip_signing=true but deploy/onym/signed/$f is missing.
+  Sign locally per the deploy/onym/README.md runbook and commit the
+  artifacts under deploy/onym/signed/, or re-run without skip_signing to
+  sign in CI."
     done
 fi
 

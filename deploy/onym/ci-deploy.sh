@@ -39,7 +39,7 @@ warn() { printf '==> WARNING: %s\n' "$*" >&2; }
 err()  { printf '==> ERROR: %s\n' "$*" >&2; }
 die()  { err "$@"; exit 1; }
 
-for c in doctl ssh rsync curl python3 dig; do
+for c in doctl ssh ssh-keyscan rsync curl python3 dig; do
     command -v "$c" >/dev/null || die "missing required command: $c"
 done
 [ -d "$SERVE_DIR" ] || die "SERVE_DIR not found: $SERVE_DIR (run ci-assemble.sh first)"
@@ -68,7 +68,14 @@ fi
 DROPLET_IP="$(doctl compute droplet get "$DROPLET_ID" --format PublicIPv4 --no-header)"
 info "droplet $DROPLET_ID ($DROPLET_IP)"
 
-SSH_OPTS=(-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=15 -i "$SSH_KEY_PATH")
+# Pin the droplet's host key instead of disabling host-key checking:
+# scan the resolved IP once, write a private known_hosts, and require a
+# match for every subsequent ssh/rsync in this run.
+KNOWN_HOSTS="$(mktemp)"
+trap 'rm -f "$KNOWN_HOSTS"' EXIT
+ssh-keyscan -T 15 "$DROPLET_IP" > "$KNOWN_HOSTS" 2>/dev/null
+[ -s "$KNOWN_HOSTS" ] || die "ssh-keyscan got no host key from $DROPLET_IP — is sshd up?"
+SSH_OPTS=(-o StrictHostKeyChecking=yes -o "UserKnownHostsFile=$KNOWN_HOSTS" -o ConnectTimeout=15 -i "$SSH_KEY_PATH")
 # shellcheck disable=SC2029  # client-side expansion of the command is intended
 ssh_do() { ssh "${SSH_OPTS[@]}" "root@$DROPLET_IP" "$@"; }
 
@@ -87,6 +94,42 @@ rsync -az -e "ssh ${SSH_OPTS[*]}" "$SERVE_DIR/" "root@$DROPLET_IP:$WEB_ROOT/"
 info "ensuring Caddy vhost for $DISCOVERY_HOST ..."
 ssh_do "bash -s -- '$DISCOVERY_HOST'" < "$SCRIPT_DIR/ensure-caddy-vhost.sh"
 
+# ─── Confirm the vhost answers BEFORE publishing DNS ──────────────────
+#
+# The A record is deliberately the LAST piece of state this deploy
+# creates. Created first, a mid-run failure leaves the host resolving to
+# a droplet with no vhost or cert — and then every genesis retry sees
+# "resolves but TLS fails" and has to lean on the recovery heuristics in
+# ci-assemble.sh. Probing the droplet IP directly (Host header carries
+# the vhost) proves Caddy loaded the site before the name goes public.
+# On a fresh vhost there is no certificate yet, so probe port 80: Caddy
+# only answers a known host there (ACME challenge / redirect-to-https);
+# an unknown host gets an empty 200 from the default server, so require
+# the https redirect (308/301) or a real 200.
+
+info "confirming the vhost answers on the droplet (before DNS)..."
+vhost_ok=false
+for i in $(seq 1 12); do
+    probe="$(curl -s -o /dev/null -w '%{http_code} %{redirect_url}' --connect-timeout 10 \
+        -H "Host: $DISCOVERY_HOST" "http://$DROPLET_IP/manifest.json" || true)"
+    code="${probe%% *}"
+    redirect="${probe#* }"
+    if { [ "$code" = "308" ] || [ "$code" = "301" ]; } \
+        && [[ "$redirect" == "https://$DISCOVERY_HOST/"* ]]; then
+        vhost_ok=true; break
+    fi
+    [ "$i" -eq 12 ] || sleep 5
+done
+if [ "$vhost_ok" = "true" ]; then
+    info "  vhost answers for $DISCOVERY_HOST on $DROPLET_IP"
+else
+    die "the Caddy vhost for $DISCOVERY_HOST is not answering on $DROPLET_IP
+  (no https redirect for the Host header after 60s). NOT publishing DNS —
+  nothing public points at a half-configured host, so a re-run stays a
+  clean genesis. Check:
+    ssh root@$DROPLET_IP 'cd /opt/onym-infra && docker compose logs caddy | tail -50'"
+fi
+
 # ─── DNS (Cloudflare, DNS-only / grey-cloud, as in onym-infra) ────────
 
 info "upserting Cloudflare A record for $DISCOVERY_HOST (DNS-only)..."
@@ -95,15 +138,29 @@ CF_ZONE_ID="$(curl -s "$CF/zones?name=$DOMAIN" -H "Authorization: Bearer $CF_API
     | python3 -c "import sys,json; r=json.load(sys.stdin)['result']; print(r[0]['id'] if r else '')")"
 [ -n "$CF_ZONE_ID" ] || die "could not find Cloudflare zone for $DOMAIN (check CF_API_TOKEN scope)"
 
+# Update the FIRST existing A record and DELETE every extra one: with
+# multiple A records DNS round-robins, and a stale record would keep
+# serving an old IP for a slice of all clients no matter what the first
+# record says.
 res="$(curl -s "$CF/zones/$CF_ZONE_ID/dns_records?type=A&name=$DISCOVERY_HOST" \
     -H "Authorization: Bearer $CF_API_TOKEN")"
-existing_id="$(echo "$res" | python3 -c "import sys,json; r=json.load(sys.stdin)['result']; print(r[0]['id'] if r else '')")"
+mapfile -t existing < <(echo "$res" | python3 -c "import sys,json
+for rec in json.load(sys.stdin)['result']:
+    print(rec['id'] + ' ' + rec['content'])")
 body="{\"type\":\"A\",\"name\":\"$DISCOVERY_HOST\",\"content\":\"$DROPLET_IP\",\"ttl\":120,\"proxied\":false}"
-if [ -n "$existing_id" ]; then
-    curl -s -X PUT "$CF/zones/$CF_ZONE_ID/dns_records/$existing_id" \
+if [ "${#existing[@]}" -gt 0 ]; then
+    first_id="${existing[0]%% *}"
+    curl -s -X PUT "$CF/zones/$CF_ZONE_ID/dns_records/$first_id" \
         -H "Authorization: Bearer $CF_API_TOKEN" -H "Content-Type: application/json" \
         --data "$body" >/dev/null
-    info "  updated $DISCOVERY_HOST -> $DROPLET_IP"
+    info "  updated $DISCOVERY_HOST -> $DROPLET_IP (record $first_id)"
+    for entry in "${existing[@]:1}"; do
+        extra_id="${entry%% *}"
+        extra_ip="${entry#* }"
+        curl -s -X DELETE "$CF/zones/$CF_ZONE_ID/dns_records/$extra_id" \
+            -H "Authorization: Bearer $CF_API_TOKEN" >/dev/null
+        info "  deleted extra A record $extra_id ($DISCOVERY_HOST -> $extra_ip) — round-robin must not serve stale IPs"
+    done
 else
     curl -s -X POST "$CF/zones/$CF_ZONE_ID/dns_records" \
         -H "Authorization: Bearer $CF_API_TOKEN" -H "Content-Type: application/json" \
@@ -115,8 +172,11 @@ info "waiting for DNS to propagate..."
 for i in $(seq 1 30); do
     [ "$(dig +short "$DISCOVERY_HOST" @1.1.1.1 | tail -1)" = "$DROPLET_IP" ] \
         && { info "  $DISCOVERY_HOST resolves"; break; }
-    [ "$i" -eq 30 ] && warn "$DISCOVERY_HOST not resolving to $DROPLET_IP yet — Caddy will retry certs once it does"
-    sleep 6
+    if [ "$i" -eq 30 ]; then
+        warn "$DISCOVERY_HOST not resolving to $DROPLET_IP yet — Caddy will retry certs once it does"
+    else
+        sleep 6
+    fi
 done
 
 # ─── Cache purge ──────────────────────────────────────────────────────

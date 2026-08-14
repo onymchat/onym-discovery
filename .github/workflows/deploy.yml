@@ -27,7 +27,7 @@ name: Deploy
 #
 # Signing SECRETS (do NOT exist yet — generate and add them, or run with
 # skip_signing=true and commit locally signed artifacts to
-# deploy/onym/out/ instead; see deploy/onym/README.md for the tradeoff):
+# deploy/onym/signed/ instead; see deploy/onym/README.md for the tradeoff):
 #   DISCOVERY_OPERATOR_SEED  64 hex chars — signs the provider manifest
 #                            and the catalog snapshot
 #   COURIER_OPERATOR_SEED    64 hex chars — signs manifests/onym-courier
@@ -48,12 +48,12 @@ on:
         required: true
         type: string
       skip_signing:
-        description: 'Deploy the pre-signed artifacts committed under deploy/onym/out/ instead of signing in CI'
+        description: 'Deploy the pre-signed artifacts committed under deploy/onym/signed/ instead of signing in CI'
         required: false
         default: false
         type: boolean
       genesis:
-        description: 'FIRST publish only: declare this the genesis build (sequence 1). Without it, any run that cannot fetch the live snapshot aborts rather than start a new chain.'
+        description: 'FIRST publish only: declare this the genesis build (sequence 1). Without it every fetch failure aborts. With it, the Cloudflare zone is cross-checked on every failure path; a wedged first deploy (record points at our droplet, nothing fetchable) recovers with a loud warning.'
         required: false
         default: false
         type: boolean
@@ -70,10 +70,12 @@ concurrency:
 jobs:
   deploy:
     runs-on: ubuntu-latest
-    # Gate the signing seeds behind the "production" environment — create
-    # it in repo Settings with required reviewers so a dispatch (and any
-    # workflow edit that reaches for the seed secrets) needs a human
-    # approval first. See deploy/onym/README.md "One-time setup".
+    # Gate the signing seeds behind the "production" environment.
+    # CAUTION: GitHub AUTO-CREATES this environment, UNPROTECTED, on the
+    # first dispatch — merely naming it here provides no approval gate.
+    # The gate exists only after an operator adds required reviewers to
+    # the environment in repo Settings, which must happen BEFORE the
+    # first dispatch. See deploy/onym/README.md "One-time setup", step 1.
     environment: production
     steps:
       - name: Require confirmation
@@ -102,6 +104,26 @@ jobs:
       - name: Install dig + rsync
         run: sudo apt-get update && sudo apt-get install -y dnsutils rsync
 
+      # ci-deploy.sh re-resolves the droplet itself; this early resolve
+      # only feeds DROPLET_IP to ci-assemble.sh, whose genesis RECOVERY
+      # path must prove a dangling A record points at OUR droplet.
+      # Non-fatal: without it that recovery path is simply unavailable
+      # (every ambiguous genesis failure aborts, as before).
+      - name: Resolve droplet IP (for the genesis recovery cross-check)
+        env:
+          DROPLET_NAME: ${{ vars.DROPLET_NAME || 'onym-infra' }}
+          DROPLET_ID: ${{ vars.DROPLET_ID }}
+        run: |
+          id="$DROPLET_ID"
+          if [ -z "$id" ] || ! doctl compute droplet get "$id" >/dev/null 2>&1; then
+            id="$(doctl compute droplet list "$DROPLET_NAME" --format ID --no-header 2>/dev/null | head -1)"
+          fi
+          ip=""
+          if [ -n "$id" ]; then
+            ip="$(doctl compute droplet get "$id" --format PublicIPv4 --no-header 2>/dev/null || true)"
+          fi
+          echo "DROPLET_IP=$ip" >> "$GITHUB_ENV"
+
       - name: Write SSH key
         env:
           SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
@@ -123,7 +145,8 @@ jobs:
           DISCOVERY_HOST: ${{ vars.DISCOVERY_HOST || 'discovery.onym.app' }}
           DOMAIN: ${{ vars.DOMAIN || 'onym.app' }}
           # Lets the genesis guard cross-check the Cloudflare A record
-          # when DNS resolution fails.
+          # on every fetch-failure path (DROPLET_IP arrives via
+          # GITHUB_ENV from the resolve step above).
           CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
           SERVE_DIR: ${{ runner.temp }}/serve
           DISCOVERY_OPERATOR_SEED: ${{ secrets.DISCOVERY_OPERATOR_SEED }}
