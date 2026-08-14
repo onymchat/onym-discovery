@@ -9,8 +9,8 @@ use onym_discovery::keys;
 use onym_discovery::sign::{detached_signature, sign_document};
 use onym_discovery::types::parse_timestamp;
 use onym_discovery::verify::{
-    sha256_digest, verify_destination, verify_manifest, verify_snapshot, ChainOutcome,
-    RetainedCatalogState,
+    sha256_digest, verify_destination, verify_detached_sig, verify_manifest, verify_snapshot,
+    ChainOutcome, RetainedCatalogState,
 };
 
 #[derive(Parser)]
@@ -73,6 +73,10 @@ enum VerifyCommand {
     /// Verify a provider manifest.
     Manifest {
         file: PathBuf,
+        /// Detached `.sig` file to check against the embedded
+        /// signature (§3 agreement, fail-closed on disagreement).
+        #[arg(long)]
+        sig: Option<PathBuf>,
         /// Evaluate expiry at this RFC 3339 instant instead of now.
         #[arg(long)]
         at: Option<String>,
@@ -83,6 +87,10 @@ enum VerifyCommand {
         file: PathBuf,
         #[arg(long)]
         manifest: PathBuf,
+        /// Detached `.sig` file to check against the embedded
+        /// signature (§3 agreement, fail-closed on disagreement).
+        #[arg(long)]
+        sig: Option<PathBuf>,
         #[arg(long)]
         previous: Option<PathBuf>,
         /// The catalog's previously declared `policy` digest
@@ -180,17 +188,23 @@ fn main() -> Result<()> {
                 &key,
                 &config_dir,
             )?;
-            std::fs::write(&out, &built.bytes)?;
             let sig = detached_signature(&built.bytes)?;
-            std::fs::write(sig_path(&out), format!("{sig}\n"))?;
             // §5 retention: every snapshot is also published as the
             // flat sibling `<catalogId>-<sequence>.json`, so that a
             // client observing a forward jump can walk the chain while
             // superseded snapshots have not yet expired.
+            // A retention sibling names one published sequence forever:
+            // overwriting an existing one with DIFFERENT bytes would
+            // both mint a fork (fresh generatedAt → different bytes for
+            // the same sequence) and destroy the evidence of it, so it
+            // is written first, refusing unless byte-identical — and a
+            // refused run leaves the mutable latest files untouched.
             let retention =
                 out.with_file_name(format!("{}-{}.json", parsed.catalog_id, built.sequence));
-            std::fs::write(&retention, &built.bytes)?;
-            std::fs::write(sig_path(&retention), format!("{sig}\n"))?;
+            write_immutable(&retention, &built.bytes)?;
+            write_immutable(&sig_path(&retention), format!("{sig}\n").as_bytes())?;
+            std::fs::write(&out, &built.bytes)?;
+            std::fs::write(sig_path(&out), format!("{sig}\n"))?;
             println!(
                 "wrote {} (sequence {}, {} bytes, digest {})",
                 out.display(),
@@ -201,8 +215,12 @@ fn main() -> Result<()> {
             println!("retention sibling {}", retention.display());
         }
         Command::Verify(command) => match command {
-            VerifyCommand::Manifest { file, at } => {
+            VerifyCommand::Manifest { file, sig, at } => {
                 let raw = std::fs::read(&file).with_context(|| file.display().to_string())?;
+                if let Some(sig) = &sig {
+                    let sig_raw = std::fs::read(sig).with_context(|| sig.display().to_string())?;
+                    verify_detached_sig(&raw, &sig_raw, false)?;
+                }
                 let verified = verify_manifest(&raw, moment(&at)?)?;
                 println!(
                     "OK {} — operator {} ({} catalogs, {} skipped, {} audience-skipped)",
@@ -213,15 +231,23 @@ fn main() -> Result<()> {
                     verified.audience_skipped.len()
                 );
                 println!("digest {}", sha256_digest(&raw));
+                if sig.is_some() {
+                    println!("detached .sig agrees with embedded signature");
+                }
             }
             VerifyCommand::Snapshot {
                 file,
                 manifest,
+                sig,
                 previous,
                 previous_policy,
                 at,
             } => {
                 let raw = std::fs::read(&file).with_context(|| file.display().to_string())?;
+                if let Some(sig) = &sig {
+                    let sig_raw = std::fs::read(sig).with_context(|| sig.display().to_string())?;
+                    verify_detached_sig(&raw, &sig_raw, true)?;
+                }
                 let manifest_raw =
                     std::fs::read(&manifest).with_context(|| manifest.display().to_string())?;
                 let now = moment(&at)?;
@@ -256,6 +282,9 @@ fn main() -> Result<()> {
                 if verified.policy_transition {
                     println!("note: policyDigest cites the previous policy declaration (transition grace)");
                 }
+                if sig.is_some() {
+                    println!("detached .sig agrees with embedded signature");
+                }
             }
             VerifyCommand::Destination { file, digest } => {
                 let raw = std::fs::read(&file).with_context(|| file.display().to_string())?;
@@ -271,6 +300,28 @@ fn load_key(seed_path: &PathBuf) -> Result<ed25519_dalek::SigningKey> {
     let seed_hex =
         std::fs::read_to_string(seed_path).with_context(|| seed_path.display().to_string())?;
     Ok(keys::signing_key_from_seed_hex(&seed_hex)?)
+}
+
+/// Write a file that names a published sequence forever: if it already
+/// exists with different bytes, refuse — a silent overwrite would fork
+/// the published chain AND destroy the evidence. A byte-identical
+/// re-run (same inputs, same --generated-at) is a no-op and succeeds.
+fn write_immutable(path: &std::path::Path, bytes: &[u8]) -> Result<()> {
+    match std::fs::read(path) {
+        Ok(existing) if existing == bytes => Ok(()),
+        Ok(_) => bail!(
+            "{} already exists with different bytes; refusing to overwrite a \
+             published retention sibling (same sequence, different bytes is a \
+             fork). If this sequence was never published, remove the file; to \
+             reproduce it byte-identically, pass the original --generated-at \
+             and --previous.",
+            path.display()
+        ),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            std::fs::write(path, bytes).with_context(|| path.display().to_string())
+        }
+        Err(e) => Err(e).with_context(|| path.display().to_string()),
+    }
 }
 
 fn sig_path(out: &std::path::Path) -> PathBuf {

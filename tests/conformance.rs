@@ -600,6 +600,47 @@ fn previous_snapshot_from_different_catalog_rejected() {
 }
 
 #[test]
+fn duplicate_key_previous_snapshot_rejected() {
+    // §3: duplicate keys make a document invalid — including the
+    // PREVIOUS snapshot handed to the retained-state constructor,
+    // whose last-key-wins tree decode was the last remaining last-wins
+    // path.
+    let (_, s1, ..) = build_chain();
+    let mut doc = s1.clone();
+    let insert_at = doc.len() - 1;
+    let dup = br#","sequence":9"#;
+    doc.splice(insert_at..insert_at, dup.iter().copied());
+    let err = RetainedCatalogState::from_snapshot_bytes(&doc, None).unwrap_err();
+    assert!(err.to_string().contains("duplicate"), "{err}");
+    // The unmodified bytes still construct fine.
+    RetainedCatalogState::from_snapshot_bytes(&s1, None).unwrap();
+}
+
+#[test]
+fn audience_skipped_catalog_gets_distinct_diagnosis() {
+    // A snapshot for a catalog the manifest declares but audience-skips
+    // (§1 non-public) is snapshot_invalid with an "audience-skipped"
+    // diagnosis, not the misleading "not declared by manifest".
+    let manifest = verify_manifest(&audience_skip_manifest_bytes(), VERIFY_AT).unwrap();
+    let (_, s1, ..) = build_chain();
+    let err = verify_snapshot(&s1, &manifest, None, VERIFY_AT).unwrap_err();
+    assert_eq!(err.code(), Some("snapshot_invalid"));
+    let message = err.to_string();
+    assert!(
+        message.contains("audience-skipped (non-public)"),
+        "{message}"
+    );
+    assert!(!message.contains("not declared"), "{message}");
+    // A catalog the manifest genuinely never declared keeps the
+    // original diagnosis.
+    let public = verify_manifest(&provider_manifest_bytes(), VERIFY_AT).unwrap();
+    let other = equivocation_snapshot_bytes("catalog-a", "66");
+    let err = verify_snapshot(&other, &public, None, VERIFY_AT).unwrap_err();
+    assert_eq!(err.code(), Some("snapshot_invalid"));
+    assert!(err.to_string().contains("not declared"), "{err}");
+}
+
+#[test]
 fn audience_skip_manifest_is_valid_and_empty() {
     // §1/§10 item 13: a manifest of decodable but non-public catalogs
     // is a valid, empty-by-policy source; the skip count is surfaced.
@@ -634,6 +675,23 @@ fn invalid_seat_types_member_skips_descriptor() {
     let verified = verify_manifest(&signed, VERIFY_AT).unwrap();
     assert_eq!(verified.catalogs.len(), 1);
     assert_eq!(verified.skipped, vec![1, 2]);
+}
+
+#[test]
+fn empty_seat_types_skips_descriptor() {
+    // An empty seatTypes array declares a catalog accepting no seat
+    // type at all — not a state §4.1 defines; treated as a
+    // descriptor-skip, consistent with member-invalid → skip.
+    let mut doc: Value = serde_json::from_slice(&provider_manifest_bytes()).unwrap();
+    doc.as_object_mut().unwrap().remove("signature");
+    let mut empty = doc["catalogs"][0].clone();
+    empty["catalogId"] = json!("empty-seats");
+    empty["seatTypes"] = json!([]);
+    doc["catalogs"].as_array_mut().unwrap().push(empty);
+    let signed = sign_document(&serde_json::to_vec(&doc).unwrap(), &key()).unwrap();
+    let verified = verify_manifest(&signed, VERIFY_AT).unwrap();
+    assert_eq!(verified.catalogs.len(), 1);
+    assert_eq!(verified.skipped, vec![1]);
 }
 
 #[test]
@@ -813,6 +871,16 @@ fn cross_catalog_equivocation_surfaced() {
         cross_catalog_equivocation(&[&a, &b]),
         CrossCatalogCheck::Conflicts(vec!["onym:component:onym-courier".to_string()])
     );
+    // Agreement is the explicit NoConflict, so an empty conflict list
+    // can never be misread as "check not applicable".
+    assert_eq!(
+        cross_catalog_equivocation(&[&a, &a]),
+        CrossCatalogCheck::NoConflict
+    );
+    assert_eq!(
+        cross_catalog_equivocation(&[&a]),
+        CrossCatalogCheck::NoConflict
+    );
 }
 
 #[test]
@@ -847,6 +915,18 @@ fn detached_sig_agreement_fails_closed() {
     // Padding differences are not disagreement: compare after decode.
     let unpadded = good.trim_end().trim_end_matches('=').to_string();
     verify_detached_sig(&manifest, unpadded.as_bytes(), false).unwrap();
+    // A CRLF line ending is not disagreement either: the trailing \r\n
+    // is trimmed, so a CRLF-minded tool's .sig gets the signature
+    // comparison, not a stray-\r base64 failure.
+    let crlf = format!("{}\r\n", good.trim_end());
+    verify_detached_sig(&manifest, crlf.as_bytes(), false).unwrap();
+    // And a CRLF .sig with a WRONG signature still gets the
+    // disagreement diagnosis.
+    let mut wrong_crlf = mismatched_detached_sig();
+    wrong_crlf.pop();
+    wrong_crlf.extend_from_slice(b"\r\n");
+    let err = verify_detached_sig(&manifest, &wrong_crlf, false).unwrap_err();
+    assert!(err.to_string().contains("disagrees"), "{err}");
 }
 
 #[test]

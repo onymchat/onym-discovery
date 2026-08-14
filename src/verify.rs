@@ -28,6 +28,10 @@ pub struct VerifiedManifest {
     /// invalidity (a manifest of all-non-public catalogs is a valid,
     /// empty-by-policy source).
     pub audience_skipped: Vec<usize>,
+    /// The `catalogId`s of the audience-skipped descriptors, tracked so
+    /// a snapshot naming one gets the accurate "audience-skipped
+    /// (non-public)" diagnosis instead of "not declared by manifest".
+    pub audience_skipped_ids: Vec<String>,
 }
 
 /// Verify a provider manifest's schema, fields, expiry, and
@@ -69,6 +73,7 @@ pub fn verify_manifest(raw: &[u8], now: OffsetDateTime) -> Result<VerifiedManife
     let mut catalogs = Vec::new();
     let mut skipped = Vec::new();
     let mut audience_skipped = Vec::new();
+    let mut audience_skipped_ids = Vec::new();
     let mut decoded_ids = std::collections::BTreeSet::new();
     for (index, value) in manifest.catalogs.iter().enumerate() {
         match decode_descriptor(value) {
@@ -85,6 +90,7 @@ pub fn verify_manifest(raw: &[u8], now: OffsetDateTime) -> Result<VerifiedManife
                     // §1: non-public catalogs are skipped, never a
                     // soft private-catalog path and never invalidity.
                     audience_skipped.push(index);
+                    audience_skipped_ids.push(descriptor.catalog_id);
                 } else {
                     catalogs.push(descriptor);
                 }
@@ -118,6 +124,7 @@ pub fn verify_manifest(raw: &[u8], now: OffsetDateTime) -> Result<VerifiedManife
         catalogs,
         skipped,
         audience_skipped,
+        audience_skipped_ids,
     })
 }
 
@@ -134,6 +141,13 @@ fn decode_descriptor(value: &Value) -> Result<CatalogDescriptor, Error> {
     // model per level).
     for member in &descriptor.seat_types {
         validate_seat_type_member(member)?;
+    }
+    // An empty `seatTypes` declares a catalog whose policy accepts no
+    // seat type at all — not a state §4.1 defines. Treated as a
+    // descriptor-skip (consistent with member-invalid → skip) pending
+    // the explicit spec pin.
+    if descriptor.seat_types.is_empty() {
+        return Err(Error::Malformed("empty seatTypes".into()));
     }
     if descriptor.seat_types.iter().any(|m| m == "*") && descriptor.seat_types.len() > 1 {
         return Err(Error::Malformed(
@@ -165,6 +179,12 @@ impl RetainedCatalogState {
     /// `policy` digest when the client retained one (the §4.2
     /// one-generation transition grace).
     pub fn from_snapshot_bytes(raw: &[u8], previous_policy: Option<String>) -> Result<Self, Error> {
+        // §3: duplicate keys make the document invalid — checked
+        // BEFORE the tree parse, whose last-key-wins decoding would
+        // otherwise let a duplicate-key previous file smuggle a chosen
+        // sequence/catalogId into the retained state.
+        reject_duplicate_keys(raw)
+            .map_err(|e| Error::Malformed(format!("previous snapshot: {e}")))?;
         let snapshot: CatalogSnapshot = serde_json::from_slice(raw)
             .map_err(|e| Error::Malformed(format!("previous snapshot: {e}")))?;
         Ok(RetainedCatalogState {
@@ -244,10 +264,26 @@ pub fn verify_snapshot(
         .iter()
         .find(|c| c.catalog_id == snapshot.catalog_id)
         .ok_or_else(|| {
-            invalid(format!(
-                "catalogId {} not declared by manifest",
-                snapshot.catalog_id
-            ))
+            // Distinguish the diagnosis: a catalog the manifest DOES
+            // declare but with a non-public audience was skipped per
+            // §1 — saying "not declared" would send the operator
+            // hunting for a typo that isn't there. Both remain
+            // snapshot_invalid.
+            if manifest
+                .audience_skipped_ids
+                .iter()
+                .any(|id| id == &snapshot.catalog_id)
+            {
+                invalid(format!(
+                    "catalog {} is audience-skipped (non-public)",
+                    snapshot.catalog_id
+                ))
+            } else {
+                invalid(format!(
+                    "catalogId {} not declared by manifest",
+                    snapshot.catalog_id
+                ))
+            }
         })?;
     // §8: retained state is per `(providerId, catalogId)` — state
     // retained for a different catalog must never be compared against
@@ -506,9 +542,12 @@ pub fn verify_detached_sig(
         .get("signature")
         .and_then(Value::as_str)
         .ok_or_else(|| fail("document has no signature field".into()))?;
+    // Trim trailing line endings including CRLF: a `.sig` written by a
+    // CRLF-minded tool must fail (or pass) on the SIGNATURE comparison,
+    // not on a stray `\r` corrupting the base64 decode's diagnosis.
     let detached = std::str::from_utf8(sig_file)
         .map_err(|_| fail("detached .sig is not UTF-8".into()))?
-        .trim_end_matches('\n');
+        .trim_end_matches(['\r', '\n']);
     let embedded_bytes =
         keys::decode_signature_b64(embedded).map_err(|e| fail(format!("embedded: {e}")))?;
     let detached_bytes =
@@ -524,7 +563,12 @@ pub fn verify_detached_sig(
 /// Outcome of the §4.2 cross-catalog equivocation check.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CrossCatalogCheck {
-    /// componentIds bound to conflicting digests within one provider.
+    /// One provider, no componentId bound to conflicting digests —
+    /// explicit, so an empty conflict list can never be misread as
+    /// "check not applicable".
+    NoConflict,
+    /// componentIds bound to conflicting digests within one provider
+    /// (always non-empty).
     Conflicts(Vec<String>),
     /// The snapshots do not all share one `providerId` — the check is
     /// defined WITHIN a provider; disagreement between providers is a
@@ -544,9 +588,12 @@ pub fn cross_catalog_equivocation(snapshots: &[&VerifiedSnapshot]) -> CrossCatal
             return CrossCatalogCheck::DifferentProviders;
         }
     }
-    CrossCatalogCheck::Conflicts(conflicting_digests(
-        snapshots.iter().map(|s| s.entries.as_slice()),
-    ))
+    let conflicts = conflicting_digests(snapshots.iter().map(|s| s.entries.as_slice()));
+    if conflicts.is_empty() {
+        CrossCatalogCheck::NoConflict
+    } else {
+        CrossCatalogCheck::Conflicts(conflicts)
+    }
 }
 
 /// §9 `source_conflict`: two configured sources bind the same

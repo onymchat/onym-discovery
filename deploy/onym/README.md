@@ -65,12 +65,32 @@ onym-discovery build-snapshot --seed operator.seed \
 onym-discovery sign-manifest --seed operator.seed provider-manifest.src.json \
   --out out/manifest.json
 
-# 5. verify everything exactly as a client will
-onym-discovery verify manifest out/manifest.json
+# 5. verify everything exactly as a client will — the bytes AND both
+#    detached .sig files (a .sig that disagrees fails the whole publish)
+onym-discovery verify manifest out/manifest.json \
+  --sig out/manifest.json.sig
 onym-discovery verify snapshot out/catalogs/onym-services.json \
-  --manifest out/manifest.json ${PREVIOUS:+--previous previous.json}
+  --manifest out/manifest.json \
+  --sig out/catalogs/onym-services.json.sig \
+  ${PREVIOUS:+--previous previous.json}
+# if this publish also changed the catalog's declared policy digest,
+# verify the way an already-subscribed client will: add the previously
+# declared digest so the §4.2 one-generation grace is what's checked
+#   ... --previous previous.json --previous-policy sha256:<previous-digest>
 
-# 6. upload out/ to the static host, byte-for-byte
+# 6. preserve the retention siblings already published (§5): copy every
+#    currently served catalogs/onym-services-<N>.json and its .sig into
+#    out/ before uploading, so a mirroring upload cannot drop them
+for f in $(curl -fsS https://discovery.onym.app/catalogs/ | grep -o 'onym-services-[0-9]*\.json\(\.sig\)\?' | sort -u); do
+  [ -e "out/catalogs/$f" ] || curl -fsS "https://discovery.onym.app/catalogs/$f" > "out/catalogs/$f"
+done
+# (if the host has no directory listing, keep out/ from the previous
+# publish, or track the served sequence numbers; the invariant is that
+# every unexpired published <N> stays served)
+
+# 7. upload out/ to the static host, byte-for-byte — and NEVER with a
+#    mirror/delete flag (rsync --delete, aws s3 sync --delete): a
+#    mirroring upload from a fresh out/ would drop retention siblings
 ```
 
 Rules that are easy to violate and must not be:
