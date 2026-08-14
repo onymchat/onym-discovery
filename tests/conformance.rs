@@ -63,7 +63,7 @@ fn destination_manifest_bytes() -> Vec<u8> {
 fn provider_manifest_bytes() -> Vec<u8> {
     let unsigned = serde_json::to_vec(&json!({
         "version": 1,
-        "implementationProfile": IMPLEMENTATION_PROFILE,
+        "implementationProfileId": IMPLEMENTATION_PROFILE,
         "providerId": "onym:component:onym-discovery",
         "operator": operator(),
         "seat": "discovery",
@@ -73,8 +73,11 @@ fn provider_manifest_bytes() -> Vec<u8> {
             "audience": "public",
             "seatTypes": ["transport.message", "notary", "moderation"],
             "policy": format!("sha256:{}", "11".repeat(32)),
+            "policyUri": "https://discovery.onym.app/policies/public-all-seats.md",
         }],
         "capabilities": ["signed-snapshot-v1", "local-filtering-v1"],
+        "privacyProfile": format!("sha256:{}", "33".repeat(32)),
+        "privacyProfileUri": "https://discovery.onym.app/privacy.md",
         "offers": [],
         "validUntil": "2026-12-31T23:59:59Z"
     }))
@@ -332,4 +335,93 @@ fn error_matches_expected_variant() {
         Some("entry_manifest_mismatch")
     );
     assert_eq!(Error::Malformed(String::new()).code(), None);
+}
+
+#[test]
+fn unknown_key_descriptor_skipped_not_fatal() {
+    // §4.1: a descriptor with unknown keys is skipped and counted,
+    // never document-fatal — valid siblings survive.
+    let mut doc: Value = serde_json::from_slice(&provider_manifest_bytes()).unwrap();
+    doc.as_object_mut().unwrap().remove("signature");
+    let mut extra = doc["catalogs"][0].clone();
+    extra["catalogId"] = json!("second-catalog");
+    extra["surprise"] = json!(true);
+    doc["catalogs"].as_array_mut().unwrap().push(extra);
+    let signed = sign_document(&serde_json::to_vec(&doc).unwrap(), &key()).unwrap();
+    let verified = verify_manifest(&signed, VERIFY_AT).unwrap();
+    assert_eq!(verified.catalogs.len(), 1);
+    assert_eq!(verified.catalogs[0].catalog_id, "public-all-seats");
+    assert_eq!(verified.skipped, vec![1]);
+}
+
+#[test]
+fn zero_surviving_descriptors_invalid() {
+    // §4.1: a manifest whose descriptors all fail lossy decode is
+    // provider_manifest_invalid, never an empty-but-valid source.
+    let mut doc: Value = serde_json::from_slice(&provider_manifest_bytes()).unwrap();
+    doc.as_object_mut().unwrap().remove("signature");
+    doc["catalogs"][0]["surprise"] = json!(true);
+    let signed = sign_document(&serde_json::to_vec(&doc).unwrap(), &key()).unwrap();
+    let err = verify_manifest(&signed, VERIFY_AT).unwrap_err();
+    assert_eq!(err.code(), Some("provider_manifest_invalid"));
+}
+
+#[test]
+fn missing_required_privacy_or_policy_fields_rejected() {
+    // privacyProfile/privacyProfileUri are required at the top level;
+    // a descriptor without policyUri fails its lossy decode.
+    for field in ["privacyProfile", "privacyProfileUri"] {
+        let mut doc: Value = serde_json::from_slice(&provider_manifest_bytes()).unwrap();
+        doc.as_object_mut().unwrap().remove("signature");
+        doc.as_object_mut().unwrap().remove(field);
+        let signed = sign_document(&serde_json::to_vec(&doc).unwrap(), &key()).unwrap();
+        let err = verify_manifest(&signed, VERIFY_AT).unwrap_err();
+        assert_eq!(err.code(), Some("provider_manifest_invalid"), "{field}");
+    }
+    let mut doc: Value = serde_json::from_slice(&provider_manifest_bytes()).unwrap();
+    doc.as_object_mut().unwrap().remove("signature");
+    doc["catalogs"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("policyUri");
+    let signed = sign_document(&serde_json::to_vec(&doc).unwrap(), &key()).unwrap();
+    let err = verify_manifest(&signed, VERIFY_AT).unwrap_err();
+    assert_eq!(err.code(), Some("provider_manifest_invalid"));
+}
+
+#[test]
+fn expiry_skew_boundary() {
+    // §4.2/§9: expired only when expiresAt is MORE than 10 minutes in
+    // the past. The chain expires 30 days after GENERATED_AT.
+    let manifest = verify_manifest(&provider_manifest_bytes(), VERIFY_AT).unwrap();
+    let (_, s1, ..) = build_chain();
+    let expires_at = datetime!(2026-09-12 00:00:00 UTC);
+    // Exactly 10 minutes past expiry: within the skew allowance.
+    verify_snapshot(
+        &s1,
+        &manifest,
+        None,
+        expires_at + time::Duration::minutes(10),
+    )
+    .unwrap();
+    // One second beyond the allowance: snapshot_expired.
+    let err = verify_snapshot(
+        &s1,
+        &manifest,
+        None,
+        expires_at + time::Duration::minutes(10) + time::Duration::seconds(1),
+    )
+    .unwrap_err();
+    assert_eq!(err.code(), Some("snapshot_expired"));
+}
+
+#[test]
+fn future_dated_snapshot_rejected() {
+    let manifest = verify_manifest(&provider_manifest_bytes(), VERIFY_AT).unwrap();
+    let (_, s1, ..) = build_chain();
+    // Verify at an instant well before generatedAt (2026-08-13): the
+    // snapshot is future-dated from that clock's perspective.
+    let early = datetime!(2026-08-01 00:00:00 UTC);
+    let err = verify_snapshot(&s1, &manifest, None, early).unwrap_err();
+    assert_eq!(err.code(), Some("snapshot_invalid"));
 }

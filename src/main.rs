@@ -185,10 +185,13 @@ fn main() -> Result<()> {
         Command::Verify(command) => match command {
             VerifyCommand::Manifest { file, at } => {
                 let raw = std::fs::read(&file).with_context(|| file.display().to_string())?;
-                let manifest = verify_manifest(&raw, moment(&at)?)?;
+                let verified = verify_manifest(&raw, moment(&at)?)?;
                 println!(
-                    "OK {} — operator {}",
-                    manifest.provider_id, manifest.operator
+                    "OK {} — operator {} ({} catalogs, {} skipped)",
+                    verified.manifest.provider_id,
+                    verified.manifest.operator,
+                    verified.catalogs.len(),
+                    verified.skipped.len()
                 );
                 println!("digest {}", sha256_digest(&raw));
             }

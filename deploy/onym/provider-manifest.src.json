@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "implementationProfile": "onym:discovery-implementation:static-ed25519-v1",
+  "implementationProfileId": "onym:discovery-implementation:static-ed25519-v1",
   "providerId": "onym:component:onym-discovery",
   "operator": "onym:key:REPLACE-OPERATOR-KEY",
   "seat": "discovery",
