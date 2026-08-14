@@ -14,9 +14,21 @@ pub fn sha256_digest(bytes: &[u8]) -> String {
     format!("sha256:{}", hex::encode(Sha256::digest(bytes)))
 }
 
+#[derive(Debug)]
+pub struct VerifiedManifest {
+    pub manifest: ProviderManifest,
+    /// Descriptors that survived lossy per-descriptor decoding.
+    pub catalogs: Vec<CatalogDescriptor>,
+    /// Indexes of `catalogs[]` descriptors that were skipped (unknown
+    /// keys or otherwise malformed) — surfaced, never silently dropped.
+    pub skipped: Vec<usize>,
+}
+
 /// Verify a provider manifest's schema, fields, expiry, and
-/// self-signature. Returns the parsed manifest.
-pub fn verify_manifest(raw: &[u8], now: OffsetDateTime) -> Result<ProviderManifest, Error> {
+/// self-signature. Catalog descriptors decode lossily (§4.1): a
+/// malformed descriptor is skipped and counted; zero surviving
+/// descriptors is `provider_manifest_invalid`.
+pub fn verify_manifest(raw: &[u8], now: OffsetDateTime) -> Result<VerifiedManifest, Error> {
     if raw.len() > MAX_MANIFEST_BYTES {
         return Err(Error::ProviderManifestInvalid(format!(
             "manifest exceeds {MAX_MANIFEST_BYTES} bytes"
@@ -45,30 +57,31 @@ pub fn verify_manifest(raw: &[u8], now: OffsetDateTime) -> Result<ProviderManife
     let operator_key =
         parse_operator_key(&manifest.operator).map_err(|e| invalid(e.to_string()))?;
 
-    if manifest.catalogs.is_empty() {
-        return Err(invalid("manifest declares no catalogs".into()));
+    // Lossy per-descriptor decode (§4.1): a descriptor with unknown
+    // keys or otherwise malformed is skipped and counted, never
+    // document-fatal; zero surviving descriptors is fatal.
+    let mut catalogs = Vec::new();
+    let mut skipped = Vec::new();
+    for (index, value) in manifest.catalogs.iter().enumerate() {
+        match decode_descriptor(value) {
+            Ok(descriptor) => catalogs.push(descriptor),
+            Err(_) => skipped.push(index),
+        }
+    }
+    if catalogs.is_empty() {
+        return Err(invalid("no surviving catalog descriptors".into()));
     }
     let mut seen = std::collections::BTreeSet::new();
-    for catalog in &manifest.catalogs {
-        validate_catalog_id(&catalog.catalog_id).map_err(|e| invalid(e.to_string()))?;
+    for catalog in &catalogs {
         if !seen.insert(catalog.catalog_id.clone()) {
             return Err(invalid(format!(
                 "duplicate catalogId {}",
                 catalog.catalog_id
             )));
         }
-        validate_uri(&catalog.snapshot).map_err(|e| invalid(e.to_string()))?;
-        validate_digest(&catalog.policy).map_err(|e| invalid(e.to_string()))?;
-        if let Some(uri) = &catalog.policy_uri {
-            validate_uri(uri).map_err(|e| invalid(e.to_string()))?;
-        }
     }
-    if let Some(uri) = &manifest.privacy_profile_uri {
-        validate_uri(uri).map_err(|e| invalid(e.to_string()))?;
-    }
-    if let Some(digest) = &manifest.privacy_profile {
-        validate_digest(digest).map_err(|e| invalid(e.to_string()))?;
-    }
+    validate_uri(&manifest.privacy_profile_uri).map_err(|e| invalid(e.to_string()))?;
+    validate_digest(&manifest.privacy_profile).map_err(|e| invalid(e.to_string()))?;
 
     let valid_until = parse_timestamp(&manifest.valid_until).map_err(|e| invalid(e.to_string()))?;
     if valid_until <= now {
@@ -85,7 +98,22 @@ pub fn verify_manifest(raw: &[u8], now: OffsetDateTime) -> Result<ProviderManife
     let bytes = signing_bytes(raw).map_err(|e| invalid(e.to_string()))?;
     keys::verify(&operator_key, &bytes, signature).map_err(|e| invalid(e.to_string()))?;
 
-    Ok(manifest)
+    Ok(VerifiedManifest {
+        manifest,
+        catalogs,
+        skipped,
+    })
+}
+
+/// Strict decode + field validation for one `catalogs[]` descriptor.
+fn decode_descriptor(value: &Value) -> Result<CatalogDescriptor, Error> {
+    let descriptor: CatalogDescriptor = serde_json::from_value(value.clone())
+        .map_err(|e| Error::Malformed(format!("descriptor: {e}")))?;
+    validate_catalog_id(&descriptor.catalog_id)?;
+    validate_uri(&descriptor.snapshot)?;
+    validate_digest(&descriptor.policy)?;
+    validate_uri(&descriptor.policy_uri)?;
+    Ok(descriptor)
 }
 
 #[derive(Debug)]
@@ -101,7 +129,7 @@ pub struct VerifiedSnapshot {
 /// the exact bytes of the previously accepted snapshot.
 pub fn verify_snapshot(
     raw: &[u8],
-    manifest: &ProviderManifest,
+    manifest: &VerifiedManifest,
     previous_raw: Option<&[u8]>,
     now: OffsetDateTime,
 ) -> Result<VerifiedSnapshot, Error> {
@@ -120,10 +148,10 @@ pub fn verify_snapshot(
     if snapshot.implementation_profile_id != IMPLEMENTATION_PROFILE {
         return Err(invalid("unsupported implementation profile".into()));
     }
-    if snapshot.provider_id != manifest.provider_id {
+    if snapshot.provider_id != manifest.manifest.provider_id {
         return Err(invalid(format!(
             "providerId {} does not match manifest {}",
-            snapshot.provider_id, manifest.provider_id
+            snapshot.provider_id, manifest.manifest.provider_id
         )));
     }
     let descriptor = manifest
@@ -192,13 +220,16 @@ pub fn verify_snapshot(
     }
     // A future-dated generatedAt would let a provider mint freshness
     // past the 90-day ceiling; allow only small clock skew.
-    if generated_at > now + time::Duration::minutes(10) {
+    if generated_at > now + CLOCK_SKEW {
         return Err(invalid(format!(
             "generatedAt {} is in the future",
             snapshot.generated_at
         )));
     }
-    if expires_at <= now {
+    // Symmetric skew (§4.2/§9): expired only when expiresAt is more
+    // than the skew allowance in the past — a fast clock must not
+    // reject a fresh snapshot.
+    if expires_at + CLOCK_SKEW < now {
         return Err(Error::SnapshotExpired(format!(
             "expired at {}",
             snapshot.expires_at
@@ -208,7 +239,7 @@ pub fn verify_snapshot(
     // Signature over the exact fetched bytes' canonical form, by the
     // manifest's operator key.
     let operator_key =
-        parse_operator_key(&manifest.operator).map_err(|e| invalid(e.to_string()))?;
+        parse_operator_key(&manifest.manifest.operator).map_err(|e| invalid(e.to_string()))?;
     let signature = snapshot
         .signature
         .as_deref()

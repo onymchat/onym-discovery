@@ -2,8 +2,9 @@
 //! static-snapshot/Ed25519 profile (`Discovery-Static-Ed25519.md` §4).
 //!
 //! Top-level documents parse strictly (`deny_unknown_fields`); catalog
-//! entries decode lossily — a malformed entry is skipped, the snapshot
-//! survives.
+//! entries and `catalogs[]` descriptors decode lossily — a malformed
+//! entry or descriptor is skipped and counted, the document survives
+//! (a manifest with zero surviving descriptors is invalid).
 
 use serde::{Deserialize, Serialize};
 use time::format_description::well_known::Rfc3339;
@@ -19,6 +20,9 @@ pub const MAX_SNAPSHOT_BYTES: usize = 1024 * 1024;
 pub const MAX_DESTINATION_MANIFEST_BYTES: usize = 256 * 1024;
 pub const MAX_ENTRIES: usize = 512;
 pub const MAX_EXPIRY_WINDOW: time::Duration = time::Duration::days(90);
+/// §4.2 / §9: clock-skew allowance applied symmetrically to
+/// `generatedAt` (future-dated check) and `expiresAt` (expiry check).
+pub const CLOCK_SKEW: time::Duration = time::Duration::minutes(10);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
@@ -28,12 +32,13 @@ pub struct ProviderManifest {
     pub provider_id: String,
     pub operator: String,
     pub seat: String,
-    pub catalogs: Vec<CatalogDescriptor>,
+    /// Lossy: descriptors are decoded individually so one malformed
+    /// descriptor cannot take the manifest down with it (§4.1); a
+    /// manifest with zero surviving descriptors is invalid.
+    pub catalogs: Vec<serde_json::Value>,
     pub capabilities: Vec<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub privacy_profile: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub privacy_profile_uri: Option<String>,
+    pub privacy_profile: String,
+    pub privacy_profile_uri: String,
     pub offers: Vec<serde_json::Value>,
     pub valid_until: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -48,8 +53,7 @@ pub struct CatalogDescriptor {
     pub audience: String,
     pub seat_types: Vec<String>,
     pub policy: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub policy_uri: Option<String>,
+    pub policy_uri: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
