@@ -118,6 +118,18 @@ then upserts the grey-cloud Cloudflare A record — DNS is the last state
 a deploy creates, so a mid-run failure never leaves a public name
 pointing at a half-configured host.
 
+**Risk: the vhost step restarts the shared proxy.** `ensure-caddy-vhost.sh`
+applies its changes with `docker compose up -d caddy`, which **recreates
+the Caddy container whenever the compose override changed** — and that
+container fronts every `onym.app` vhost, including the relayer's
+WebSocket endpoints (`wss://`). Open connections drop and clients must
+reconnect. Expect this on the first discovery deploy and on every
+discovery deploy after onym-infra's own deploy has swept the override
+away (its rsync `--delete` removes the override; the next run here puts
+it back). The script announces the recreation in the log before issuing
+it; the throwaway-container validation that precedes it guards against
+a bad config, not against the restart itself.
+
 Secrets it needs, matching onym-infra's names where they already exist:
 
 | Secret | Status |
@@ -257,11 +269,21 @@ fi
 # 4. build the snapshot (chain onto the previously PUBLISHED bytes;
 #    same temp-then-move pattern — a failed fetch must not leave an
 #    empty previous.json that a later run mistakes for a document)
+rm -f previous.json   # a stale fetch from an EARLIER run must not
+                      # linger: chaining onto yesterday's bytes would
+                      # fork the live chain just as surely as genesis
 if curl -fsS "$base/onym-services.json" -o previous.json.tmp; then
-  mv previous.json.tmp previous.json; PREVIOUS=1
+  mv previous.json.tmp previous.json
 else
-  rm -f previous.json.tmp; PREVIOUS=   # first publish: no previous
+  rm -f previous.json.tmp   # nothing fetched — but only a TRUE first
+                            # publish may proceed unchained; if a
+                            # snapshot was ever published, stop here
+                            # and fix the fetch instead
 fi
+# PREVIOUS gates every ${PREVIOUS:+...} below (steps 4 and 6): set only
+# when a non-empty previous.json actually landed, so the --previous
+# flags engage exactly when there are previous bytes to chain onto
+PREVIOUS=$([ -s previous.json ] && echo 1 || true)
 onym-discovery build-snapshot --seed operator.seed \
   --config catalogs/onym-services.config.json \
   ${PREVIOUS:+--previous previous.json} \
@@ -293,6 +315,33 @@ onym-discovery verify snapshot signed/catalogs/onym-services.json \
 #    run the deploy workflow with skip_signing: true, or rsync it to
 #    /var/www/discovery on the droplet yourself.
 ```
+
+## Recovery: a run that wedged after the rsync
+
+Once the rsync has landed, the droplet already serves the new bytes —
+even when the run then died later, typically at the final health check
+while a first deploy waits out certificate issuance. From that point a
+`skip_signing: true` **re-run of the same committed artifacts cannot
+succeed**: `ci-assemble.sh` fetches the live snapshot to chain onto,
+that fetch now returns the exact bytes sitting under `signed/`, and the
+verify gate compares the snapshot against itself — a snapshot can never
+be its own predecessor (`previousDigest` names the sequence before it),
+so the run aborts before deploying anything. That abort is the verify
+gate doing its job, not a transient failure; retrying the workflow
+cannot clear it.
+
+What actually recovers each case:
+
+- **Wedged at the health check only** (cert pending): there may be
+  nothing to redeploy — the artifacts are live. Wait for Caddy to
+  finish issuance and confirm `https://discovery.onym.app/manifest.json`
+  serves the expected bytes.
+- **A real redeploy is needed**: sign a **new sequence locally** per
+  the runbook above — it chains onto the now-live snapshot — commit it
+  under `signed/`, and dispatch again with `skip_signing: true`.
+- **CI-signing runs** (`skip_signing: false`) are immune: every run
+  signs a fresh sequence chained onto whatever is live, so a plain
+  re-dispatch works.
 
 Rules that are easy to violate and must not be:
 

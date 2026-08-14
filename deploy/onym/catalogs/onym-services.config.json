@@ -40,7 +40,7 @@
       "manifest": {
         "uri": "https://discovery.onym.app/manifests/onym-courier.json"
       },
-      "manifestFile": "../out/manifests/onym-courier.json",
+      "manifestFile": "../signed/manifests/onym-courier.json",
       "operator": "onym:key:REPLACE-COURIER-KEY",
       "profiles": [
         "onym:message-implementation:nostr-courier-v1"
@@ -55,7 +55,7 @@
       "manifest": {
         "uri": "https://discovery.onym.app/manifests/onym-blossom.json"
       },
-      "manifestFile": "../out/manifests/onym-blossom.json",
+      "manifestFile": "../signed/manifests/onym-blossom.json",
       "operator": "onym:key:REPLACE-BLOSSOM-KEY",
       "profiles": [
         "onym:blob-implementation:blossom-v1"

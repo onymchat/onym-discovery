@@ -134,19 +134,33 @@ fi
 
 info "upserting Cloudflare A record for $DISCOVERY_HOST (DNS-only)..."
 CF="https://api.cloudflare.com/client/v4"
-CF_ZONE_ID="$(curl -s "$CF/zones?name=$DOMAIN" -H "Authorization: Bearer $CF_API_TOKEN" \
-    | python3 -c "import sys,json; r=json.load(sys.stdin)['result']; print(r[0]['id'] if r else '')")"
+CF_ZONE_ID="$(curl -fsS "$CF/zones?name=$DOMAIN" -H "Authorization: Bearer $CF_API_TOKEN" \
+    | python3 -c "import sys,json; r=json.load(sys.stdin)['result']; print(r[0]['id'] if r else '')")" \
+    || die "could not query Cloudflare for the $DOMAIN zone"
 [ -n "$CF_ZONE_ID" ] || die "could not find Cloudflare zone for $DOMAIN (check CF_API_TOKEN scope)"
 
 # Update the FIRST existing A record and DELETE every extra one: with
 # multiple A records DNS round-robins, and a stale record would keep
 # serving an old IP for a slice of all clients no matter what the first
-# record says.
-res="$(curl -s "$CF/zones/$CF_ZONE_ID/dns_records?type=A&name=$DISCOVERY_HOST" \
-    -H "Authorization: Bearer $CF_API_TOKEN")"
-mapfile -t existing < <(echo "$res" | python3 -c "import sys,json
-for rec in json.load(sys.stdin)['result']:
-    print(rec['id'] + ' ' + rec['content'])")
+# record says. The listing FAILS CLOSED: an unreadable list (curl
+# failure, API error, success:false) must die here — falling through to
+# the POST branch on an empty list would create a duplicate A record,
+# exactly the round-robin staleness the delete loop exists to prevent.
+res="$(curl -fsS "$CF/zones/$CF_ZONE_ID/dns_records?type=A&name=$DISCOVERY_HOST" \
+    -H "Authorization: Bearer $CF_API_TOKEN")" \
+    || die "could not list Cloudflare A records for $DISCOVERY_HOST — refusing to
+  guess (a blind POST could duplicate an existing record); fix the API access
+  and re-run"
+existing_raw="$(python3 -c "import sys, json
+resp = json.load(sys.stdin)
+if not resp.get('success'):
+    sys.exit('Cloudflare returned success=false: ' + json.dumps(resp.get('errors')))
+for rec in resp['result']:
+    print(rec['id'] + ' ' + rec['content'])" <<<"$res")" \
+    || die "Cloudflare A-record listing for $DISCOVERY_HOST could not be read —
+  refusing to guess (a blind POST could duplicate an existing record)"
+existing=()
+[ -z "$existing_raw" ] || mapfile -t existing <<<"$existing_raw"
 body="{\"type\":\"A\",\"name\":\"$DISCOVERY_HOST\",\"content\":\"$DROPLET_IP\",\"ttl\":120,\"proxied\":false}"
 if [ "${#existing[@]}" -gt 0 ]; then
     first_id="${existing[0]%% *}"

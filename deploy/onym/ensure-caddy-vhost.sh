@@ -139,6 +139,16 @@ services:
       - ./caddy.d:/etc/caddy/caddy.d:ro
 EOF
 
+# Coupling note (verified against the onym-infra repo): the Caddyfile
+# this appends to is GIT-TRACKED in onym-infra (`git ls-files` lists
+# `Caddyfile` at the repo root) and bind-mounted into the stock
+# caddy:2-alpine image (`./Caddyfile:/etc/caddy/Caddyfile:ro`,
+# docker-compose.yml line 46). onym-infra's deploy rsyncs the repo with
+# --delete, which rewrites the Caddyfile from that tracked copy —
+# dropping this appended import — in the same sweep that deletes
+# caddy.d/ and the compose override. The guarded import therefore
+# cannot outlive the caddy.d mount it depends on; the next discovery
+# deploy reinstates both together.
 if ! grep -qF "$IMPORT_LINE" "$CADDYFILE"; then
     printf '\n# Extra vhosts installed by service deploys (onym-discovery).\n%s\n' \
         "$IMPORT_LINE" >> "$CADDYFILE"
@@ -178,7 +188,10 @@ fi
 # a persistent reload failure is an environment problem: roll the files
 # back (and best-effort reload the restored config) rather than leave
 # on-disk state that the running Caddy never accepted.
-info "applying (recreate if mounts changed, then reload)..."
+info "applying: 'docker compose up -d caddy' may now RECREATE the SHARED Caddy"
+info "  container — it fronts EVERY onym.app vhost (relayer wss://, moderation,"
+info "  the works), so open WebSocket connections will drop and reconnect."
+info "  Validation above guarded the config, not this restart."
 docker compose up -d caddy
 reloaded=false
 for attempt in 1 2 3 4 5; do

@@ -409,9 +409,44 @@ if [ "$SKIP_SIGNING" != "true" ]; then
     "$BIN" sign-manifest --seed "$SEEDS/blossom.seed" \
         "$SRC/manifests/onym-blossom.src.json" --out "$OUT/manifests/onym-blossom.json"
 
+    # The committed config's manifestFile paths point at ../signed/manifests/
+    # — the artifacts the LOCAL runbook signs, so a fresh clone works with
+    # no CI scratch present. CI signs into its own scratch ($OUT) instead,
+    # and deliberately does NOT copy scratch into the committed signed/
+    # tree (the two modes must never contaminate each other). So the
+    # snapshot is built against a derived config in $WORK whose
+    # manifestFile paths are rewritten to ABSOLUTE paths: entries under
+    # signed/manifests/ are repointed into the $OUT this run just
+    # recreated (rm -rf above — stale scratch bytes can never be the ones
+    # digest-pinned), and every other entry (reviewed/*.json) resolves to
+    # the same committed file it already named, made absolute only because
+    # the derived config no longer lives in catalogs/.
+    CI_CONFIG="$WORK/onym-services.config.json"
+    python3 - "$CONFIG" "$OUT" "$CI_CONFIG" <<'PY'
+import json, os, sys
+
+config_path, out_dir, resolved_path = sys.argv[1:4]
+config_dir = os.path.dirname(os.path.abspath(config_path))
+signed_manifests = os.path.normpath(os.path.join(config_dir, "..", "signed", "manifests"))
+
+with open(config_path) as handle:
+    config = json.load(handle)
+for entry in config.get("entries", []):
+    path = entry.get("manifestFile")
+    if path is None:
+        continue
+    absolute = os.path.normpath(os.path.join(config_dir, path))
+    if os.path.dirname(absolute) == signed_manifests:
+        absolute = os.path.join(os.path.abspath(out_dir), "manifests",
+                                os.path.basename(absolute))
+    entry["manifestFile"] = absolute
+with open(resolved_path, "w") as handle:
+    json.dump(config, handle, indent=2)
+PY
+
     info "building snapshot..."
     "$BIN" build-snapshot --seed "$SEEDS/discovery.seed" \
-        --config "$CONFIG" \
+        --config "$CI_CONFIG" \
         ${PREV_ARGS[@]+"${PREV_ARGS[@]}"} \
         --out "$OUT/catalogs/onym-services.json"
 
