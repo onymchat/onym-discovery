@@ -53,19 +53,66 @@ curl -fsS https://relayer.onym.app/manifest.json  > reviewed/onym-relayer.json
 curl -fsS https://moderation.onym.app/manifest.json > reviewed/onym-authority.json
 # read them; the digest you pin is the review you performed
 
-# 3. build the snapshot (chain onto the previously PUBLISHED bytes)
-curl -fsS https://discovery.onym.app/catalogs/onym-services.json > previous.json \
-  || true   # first publish: no previous
+# 3. backfill the retention siblings already published (§5) into out/
+#    BEFORE building: build-snapshot writes the new sequence's sibling
+#    with an overwrite guard that refuses to replace a same-named file
+#    with different bytes — the guard can only catch an accidental
+#    re-mint of an already-published sequence if the previously
+#    published bytes are sitting in out/ when the build runs. It also
+#    keeps a later mirroring upload from dropping the siblings.
+mkdir -p out/catalogs
+base=https://discovery.onym.app/catalogs
+fetch() {  # fetch to a temp file, move into place only on success —
+           # a failed curl must never leave a 0-byte file behind
+  curl -fsS "$base/$1" -o "out/catalogs/$1.tmp" \
+    && mv "out/catalogs/$1.tmp" "out/catalogs/$1" \
+    || { rm -f "out/catalogs/$1.tmp"; return 1; }
+}
+if listing=$(curl -fsS "$base/"); then
+  siblings=$(printf '%s\n' "$listing" \
+    | grep -o 'onym-services-[0-9]*\.json\(\.sig\)\?' | sort -u)
+  # a served index that lists no siblings is only correct before the
+  # first publish — on any later publish treat it as a failed listing,
+  # never as "nothing to preserve"
+  for f in $siblings; do
+    [ -e "out/catalogs/$f" ] || fetch "$f" \
+      || { echo "FATAL: could not fetch published sibling $f" >&2; exit 1; }
+  done
+else
+  echo "WARNING: cannot enumerate $base/ (no directory listing?)" >&2
+  echo "backfilling by explicit sequence range instead" >&2
+  # walk N down from the currently served sequence until the first 404
+  # (older siblings past that have expired and been removed)
+  current=$(curl -fsS "$base/onym-services.json" \
+    | grep -o '"sequence":[0-9]*' | head -1 | cut -d: -f2)
+  [ -n "$current" ] || current=0   # nothing served yet: first publish
+  n=$((current - 1))
+  while [ "$n" -ge 1 ]; do
+    fetch "onym-services-$n.json" || break
+    fetch "onym-services-$n.json.sig" \
+      || { echo "FATAL: sibling $n served without its .sig" >&2; exit 1; }
+    n=$((n - 1))
+  done
+fi
+
+# 4. build the snapshot (chain onto the previously PUBLISHED bytes;
+#    same temp-then-move pattern — a failed fetch must not leave an
+#    empty previous.json that a later run mistakes for a document)
+if curl -fsS "$base/onym-services.json" -o previous.json.tmp; then
+  mv previous.json.tmp previous.json; PREVIOUS=1
+else
+  rm -f previous.json.tmp; PREVIOUS=   # first publish: no previous
+fi
 onym-discovery build-snapshot --seed operator.seed \
   --config catalogs/onym-services.config.json \
   ${PREVIOUS:+--previous previous.json} \
   --out out/catalogs/onym-services.json
 
-# 4. sign the provider manifest (only when it changed)
+# 5. sign the provider manifest (only when it changed)
 onym-discovery sign-manifest --seed operator.seed provider-manifest.src.json \
   --out out/manifest.json
 
-# 5. verify everything exactly as a client will — the bytes AND both
+# 6. verify everything exactly as a client will — the bytes AND both
 #    detached .sig files (a .sig that disagrees fails the whole publish)
 onym-discovery verify manifest out/manifest.json \
   --sig out/manifest.json.sig
@@ -77,20 +124,13 @@ onym-discovery verify snapshot out/catalogs/onym-services.json \
 # verify the way an already-subscribed client will: add the previously
 # declared digest so the §4.2 one-generation grace is what's checked
 #   ... --previous previous.json --previous-policy sha256:<previous-digest>
-
-# 6. preserve the retention siblings already published (§5): copy every
-#    currently served catalogs/onym-services-<N>.json and its .sig into
-#    out/ before uploading, so a mirroring upload cannot drop them
-for f in $(curl -fsS https://discovery.onym.app/catalogs/ | grep -o 'onym-services-[0-9]*\.json\(\.sig\)\?' | sort -u); do
-  [ -e "out/catalogs/$f" ] || curl -fsS "https://discovery.onym.app/catalogs/$f" > "out/catalogs/$f"
-done
-# (if the host has no directory listing, keep out/ from the previous
-# publish, or track the served sequence numbers; the invariant is that
-# every unexpired published <N> stays served)
+# (the grace lasts ONE generation: subscribed clients drop the retained
+# previous digest after their first acceptance citing the current one)
 
 # 7. upload out/ to the static host, byte-for-byte — and NEVER with a
-#    mirror/delete flag (rsync --delete, aws s3 sync --delete): a
-#    mirroring upload from a fresh out/ would drop retention siblings
+#    mirror/delete flag (rsync --delete, aws s3 sync --delete): out/
+#    now contains every unexpired retention sibling, but a mirroring
+#    upload from a fresh or partial out/ would still drop history
 ```
 
 Rules that are easy to violate and must not be:

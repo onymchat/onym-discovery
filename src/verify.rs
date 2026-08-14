@@ -163,10 +163,14 @@ fn decode_descriptor(value: &Value) -> Result<CatalogDescriptor, Error> {
 /// one-generation transition grace).
 #[derive(Debug, Clone)]
 pub struct RetainedCatalogState {
-    /// The catalog the retained snapshot belongs to — retained state is
-    /// keyed per `(providerId, catalogId)` (§8), so comparing a
-    /// snapshot against state retained for a DIFFERENT catalog is a
-    /// caller error, rejected distinctly (not as a fork).
+    /// The provider the retained snapshot belongs to — retained state
+    /// is keyed per `(providerId, catalogId)` (§8), so comparing a
+    /// snapshot against state retained for a DIFFERENT provider is a
+    /// caller error, rejected distinctly (never a fork or rollback).
+    pub provider_id: String,
+    /// The catalog the retained snapshot belongs to — same §8 keying:
+    /// state retained for a DIFFERENT catalog is a caller error,
+    /// rejected distinctly (not as a fork).
     pub catalog_id: String,
     pub sequence: u64,
     pub digest: String,
@@ -178,21 +182,54 @@ impl RetainedCatalogState {
     /// accepted snapshot, plus the catalog's previously declared
     /// `policy` digest when the client retained one (the §4.2
     /// one-generation transition grace).
+    ///
+    /// The grace is bounded to ONE accepted generation, and expiring
+    /// it is the CALLER's obligation: drop `previous_policy` after the
+    /// first accepted snapshot that cites the manifest's current
+    /// policy (the accepted [`VerifiedSnapshot`] reports which digest
+    /// matched via its `policy_transition` flag; [`Self::after_acceptance`]
+    /// computes the successor state with the drop applied). A retained
+    /// `previous_policy` carried indefinitely would let a provider keep
+    /// publishing against a superseded policy forever.
     pub fn from_snapshot_bytes(raw: &[u8], previous_policy: Option<String>) -> Result<Self, Error> {
         // §3: duplicate keys make the document invalid — checked
         // BEFORE the tree parse, whose last-key-wins decoding would
         // otherwise let a duplicate-key previous file smuggle a chosen
-        // sequence/catalogId into the retained state.
+        // sequence/providerId/catalogId into the retained state.
         reject_duplicate_keys(raw)
             .map_err(|e| Error::Malformed(format!("previous snapshot: {e}")))?;
         let snapshot: CatalogSnapshot = serde_json::from_slice(raw)
             .map_err(|e| Error::Malformed(format!("previous snapshot: {e}")))?;
         Ok(RetainedCatalogState {
+            provider_id: snapshot.provider_id,
             catalog_id: snapshot.catalog_id,
             sequence: snapshot.sequence,
             digest: sha256_digest(raw),
             previous_policy,
         })
+    }
+
+    /// The state to retain after ACCEPTING `verified` — discharges the
+    /// caller obligation documented on [`Self::from_snapshot_bytes`]:
+    /// the retained `previous_policy` survives only while the accepted
+    /// snapshot still cites it (`policy_transition` true); the first
+    /// accepted snapshot citing the manifest's CURRENT policy drops it,
+    /// closing the §4.2 one-generation grace window.
+    pub fn after_acceptance(
+        previous: Option<&RetainedCatalogState>,
+        verified: &VerifiedSnapshot,
+    ) -> Self {
+        RetainedCatalogState {
+            provider_id: verified.snapshot.provider_id.clone(),
+            catalog_id: verified.snapshot.catalog_id.clone(),
+            sequence: verified.snapshot.sequence,
+            digest: verified.digest.clone(),
+            previous_policy: if verified.policy_transition {
+                previous.and_then(|p| p.previous_policy.clone())
+            } else {
+                None
+            },
+        }
     }
 }
 
@@ -226,7 +263,13 @@ pub struct VerifiedSnapshot {
     pub outcome: ChainOutcome,
     /// True when `policyDigest` matched the retained PREVIOUS policy
     /// declaration rather than the manifest's current one — accepted
-    /// with a surfaced policy-transition note (§4.2).
+    /// with a surfaced policy-transition note (§4.2). This is the
+    /// caller's signal for bounding the grace to one generation: drop
+    /// the retained `previous_policy` after the first accepted
+    /// snapshot where this is `false` under a retained previous policy
+    /// — i.e. the first acceptance that cites the current policy
+    /// ([`RetainedCatalogState::after_acceptance`] applies exactly
+    /// that rule).
     pub policy_transition: bool,
 }
 
@@ -286,9 +329,16 @@ pub fn verify_snapshot(
             }
         })?;
     // §8: retained state is per `(providerId, catalogId)` — state
-    // retained for a different catalog must never be compared against
-    // this snapshot's chain (a distinct rejection, not a "fork").
+    // retained for a different provider or a different catalog must
+    // never be compared against this snapshot's chain (a distinct
+    // caller-error rejection, never a "fork" or "rollback").
     if let Some(r) = retained {
+        if r.provider_id != snapshot.provider_id {
+            return Err(invalid(format!(
+                "previous snapshot is from a different provider ({} vs {})",
+                r.provider_id, snapshot.provider_id
+            )));
+        }
         if r.catalog_id != snapshot.catalog_id {
             return Err(invalid(format!(
                 "previous snapshot is for a different catalog ({} vs {})",

@@ -600,6 +600,75 @@ fn previous_snapshot_from_different_catalog_rejected() {
 }
 
 #[test]
+fn previous_snapshot_from_different_provider_rejected() {
+    // §8: retained state is per (providerId, catalogId). The conflict
+    // provider's catalog is ALSO named "public-all-seats", so a
+    // catalogId-only identity check would sail past this and misreport
+    // the mismatch as a same-sequence fork. It must be the distinct
+    // caller-error rejection — never "fork", never "rollback".
+    let manifest = verify_manifest(&provider_manifest_bytes(), VERIFY_AT).unwrap();
+    let (_, s1, ..) = build_chain();
+    let state =
+        RetainedCatalogState::from_snapshot_bytes(&conflict_snapshot_bytes(), None).unwrap();
+    assert_eq!(state.catalog_id, "public-all-seats");
+    let err = verify_snapshot(&s1, &manifest, Some(&state), VERIFY_AT).unwrap_err();
+    assert_eq!(err.code(), Some("snapshot_invalid"));
+    let message = err.to_string();
+    assert!(message.contains("different provider"), "{message}");
+    assert!(!message.contains("fork"), "{message}");
+    assert!(!message.contains("rollback"), "{message}");
+}
+
+#[test]
+fn after_acceptance_bounds_grace_to_one_generation() {
+    // The §4.2 grace expiry is a caller obligation; after_acceptance
+    // discharges it: previous_policy survives only while the accepted
+    // snapshot still cites it, and the first acceptance citing the
+    // manifest's CURRENT policy drops it.
+    let previous_digest = format!("sha256:{}", "11".repeat(32));
+    let (_, s1, s2, _) = build_chain();
+    let state =
+        RetainedCatalogState::from_snapshot_bytes(&s1, Some(previous_digest.clone())).unwrap();
+    // Under the updated manifest the snapshot still cites the previous
+    // policy: transition fires, and the retained grace carries over.
+    let transition = verify_manifest(&transition_manifest_bytes(), VERIFY_AT).unwrap();
+    let v = verify_snapshot(&s2, &transition, Some(&state), VERIFY_AT).unwrap();
+    assert!(v.policy_transition);
+    let carried = RetainedCatalogState::after_acceptance(Some(&state), &v);
+    assert_eq!(
+        carried.previous_policy.as_deref(),
+        Some(previous_digest.as_str())
+    );
+    assert_eq!(carried.sequence, 2);
+    assert_eq!(carried.provider_id, "onym:component:onym-discovery");
+    // Under a manifest whose CURRENT policy the snapshot cites, the
+    // first acceptance closes the window: previous_policy dropped.
+    let current = verify_manifest(&provider_manifest_bytes(), VERIFY_AT).unwrap();
+    let v = verify_snapshot(&s2, &current, Some(&state), VERIFY_AT).unwrap();
+    assert!(!v.policy_transition);
+    let closed = RetainedCatalogState::after_acceptance(Some(&state), &v);
+    assert!(closed.previous_policy.is_none());
+}
+
+#[test]
+fn duplicate_key_previous_snapshot_rejected_by_builder() {
+    // §3: the builder derives the new sequence and previousDigest from
+    // the --previous bytes, so a duplicate-key previous file must be
+    // rejected BEFORE the last-key-wins tree parse can pick a value.
+    let (destination, s1, ..) = build_chain();
+    let config = snapshot_config(&sha256_digest(&destination));
+    let mut doc = s1.clone();
+    let insert_at = doc.len() - 1;
+    let dup = br#","sequence":9"#;
+    doc.splice(insert_at..insert_at, dup.iter().copied());
+    let err =
+        build_snapshot(&config, Some(&doc), GENERATED_AT, &key(), &fixtures_dir()).unwrap_err();
+    assert!(err.to_string().contains("duplicate"), "{err}");
+    // The unmodified previous bytes still build fine.
+    build_snapshot(&config, Some(&s1), GENERATED_AT, &key(), &fixtures_dir()).unwrap();
+}
+
+#[test]
 fn duplicate_key_previous_snapshot_rejected() {
     // §3: duplicate keys make a document invalid — including the
     // PREVIOUS snapshot handed to the retained-state constructor,

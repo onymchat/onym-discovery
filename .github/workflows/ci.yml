@@ -38,3 +38,12 @@ jobs:
             --previous "$TMP/out/smoke-1.json" --out "$TMP/out/smoke.json"
           test -f "$TMP/out/smoke-2.json"
           test -f "$TMP/out/smoke-2.json.sig"
+          # Verify exactly as a client will, over the byte-pinned
+          # fixtures: manifest with its detached .sig, then a chained
+          # snapshot against the retained previous one.
+          AT=2026-08-14T00:00:00Z
+          $BIN verify manifest tests/fixtures/provider-manifest.json \
+            --sig tests/fixtures/provider-manifest.json.sig --at "$AT"
+          $BIN verify snapshot tests/fixtures/snapshot-2.json \
+            --manifest tests/fixtures/provider-manifest.json \
+            --previous tests/fixtures/snapshot-1.json --at "$AT"

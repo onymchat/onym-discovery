@@ -281,6 +281,12 @@ fn main() -> Result<()> {
                 }
                 if verified.policy_transition {
                     println!("note: policyDigest cites the previous policy declaration (transition grace)");
+                    println!(
+                        "note: the grace is bounded to ONE accepted generation — retaining \
+                         the previous policy digest is the caller's obligation to expire: \
+                         drop --previous-policy after the first accepted snapshot that \
+                         cites the current policy"
+                    );
                 }
                 if sig.is_some() {
                     println!("detached .sig agrees with embedded signature");
