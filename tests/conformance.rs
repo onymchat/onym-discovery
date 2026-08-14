@@ -8,18 +8,24 @@
 //! DISCOVERY_REGEN_FIXTURES=1 cargo test --test conformance
 //! ```
 //!
-//! Client implementations (the iOS `OnymDiscovery` package) consume
-//! these exact files; a byte change here is a cross-repo event, not a
-//! formality.
+//! Client implementations (the iOS and Android discovery packages)
+//! consume these exact files; a byte change here is a cross-repo
+//! event, not a formality.
+//!
+//! §10 item 9 (the privacy fetch trace) is not representable as an
+//! offline byte fixture — it is a network-behavior obligation on
+//! clients (snapshot download + local filtering, no per-query
+//! requests, no cookies or identifiers) and is discharged by client
+//! test suites, not by a file here.
 
 use serde_json::{json, Value};
 use time::macros::datetime;
 
 use onym_discovery::build::{build_snapshot, SnapshotConfig};
-use onym_discovery::canonical::signing_bytes;
+use onym_discovery::canonical::{reject_duplicate_keys, signing_bytes};
 use onym_discovery::error::Error;
 use onym_discovery::keys;
-use onym_discovery::sign::sign_document;
+use onym_discovery::sign::{detached_signature, sign_document};
 use onym_discovery::types::*;
 use onym_discovery::verify::*;
 
@@ -40,8 +46,16 @@ fn key() -> ed25519_dalek::SigningKey {
     keys::signing_key_from_seed_hex(SEED_HEX).unwrap()
 }
 
+fn other_key() -> ed25519_dalek::SigningKey {
+    keys::signing_key_from_seed_hex(OTHER_SEED_HEX).unwrap()
+}
+
 fn operator() -> String {
     keys::operator_id(&key().verifying_key())
+}
+
+fn retained(bytes: &[u8]) -> RetainedCatalogState {
+    RetainedCatalogState::from_snapshot_bytes(bytes).unwrap()
 }
 
 fn destination_manifest_bytes() -> Vec<u8> {
@@ -85,6 +99,176 @@ fn provider_manifest_bytes() -> Vec<u8> {
     sign_document(&unsigned, &key()).unwrap()
 }
 
+/// §10 item 10: the provider manifest re-signed with a NEW policy
+/// digest, while the latest snapshot still cites the previous one.
+fn transition_manifest_bytes() -> Vec<u8> {
+    let mut doc: Value = serde_json::from_slice(&provider_manifest_bytes()).unwrap();
+    doc.as_object_mut().unwrap().remove("signature");
+    doc["catalogs"][0]["policy"] = json!(format!("sha256:{}", "22".repeat(32)));
+    sign_document(&serde_json::to_vec(&doc).unwrap(), &key()).unwrap()
+}
+
+/// §10 item 13: a valid manifest whose single catalog is non-public —
+/// an empty-by-policy source, skip count surfaced, never invalid.
+fn audience_skip_manifest_bytes() -> Vec<u8> {
+    let mut doc: Value = serde_json::from_slice(&provider_manifest_bytes()).unwrap();
+    doc.as_object_mut().unwrap().remove("signature");
+    doc["catalogs"][0]["audience"] = json!("internal");
+    sign_document(&serde_json::to_vec(&doc).unwrap(), &key()).unwrap()
+}
+
+/// §10 item 7: a second, independently keyed provider binding the same
+/// componentId to a DIFFERENT manifest digest.
+fn conflict_provider_bytes() -> Vec<u8> {
+    let unsigned = serde_json::to_vec(&json!({
+        "version": 1,
+        "implementationProfileId": IMPLEMENTATION_PROFILE,
+        "providerId": "onym:component:example-directory",
+        "operator": keys::operator_id(&other_key().verifying_key()),
+        "seat": "discovery",
+        "catalogs": [{
+            "catalogId": "public-all-seats",
+            "snapshot": "https://directory.example.org/catalogs/public-all-seats.json",
+            "audience": "public",
+            "seatTypes": ["*"],
+            "policy": format!("sha256:{}", "11".repeat(32)),
+            "policyUri": "https://directory.example.org/policies/public-all-seats.md",
+        }],
+        "capabilities": ["signed-snapshot-v1", "local-filtering-v1"],
+        "privacyProfile": format!("sha256:{}", "33".repeat(32)),
+        "privacyProfileUri": "https://directory.example.org/privacy.md",
+        "offers": [],
+        "validUntil": "2026-12-31T23:59:59Z"
+    }))
+    .unwrap();
+    sign_document(&unsigned, &other_key()).unwrap()
+}
+
+fn conflict_snapshot_bytes() -> Vec<u8> {
+    let config: SnapshotConfig = serde_json::from_value(json!({
+        "catalogId": "public-all-seats",
+        "providerId": "onym:component:example-directory",
+        "policyDigest": format!("sha256:{}", "11".repeat(32)),
+        "expiryDays": 30,
+        "entries": [{
+            "componentId": "onym:component:onym-courier",
+            "seatType": "transport.message",
+            "manifest": {
+                "uri": "https://directory.example.org/manifests/onym-courier.json",
+                "digest": format!("sha256:{}", "44".repeat(32)),
+            },
+            "operator": operator(),
+            "profiles": ["onym:message-implementation:nostr-courier-v1"],
+            "listedAt": "2026-08-13T00:00:00Z",
+            "relationship": "none",
+            "placement": "policy-ranked"
+        }]
+    }))
+    .unwrap();
+    build_snapshot(&config, None, GENERATED_AT, &other_key(), &fixtures_dir())
+        .unwrap()
+        .bytes
+}
+
+/// §10 items 6 and the §4.2 status obligation: a snapshot carrying a
+/// sponsored-placement disclosure and a disclosed-warning entry, both
+/// of which MUST survive into the client's rendered attribution.
+fn sponsored_snapshot_bytes(destination_digest: &str) -> Vec<u8> {
+    let config: SnapshotConfig = serde_json::from_value(json!({
+        "catalogId": "public-all-seats",
+        "providerId": "onym:component:onym-discovery",
+        "policyDigest": format!("sha256:{}", "11".repeat(32)),
+        "expiryDays": 30,
+        "entries": [{
+            "componentId": "onym:component:onym-courier",
+            "seatType": "transport.message",
+            "manifest": {
+                "uri": "https://discovery.onym.app/manifests/onym-courier.json",
+                "digest": destination_digest,
+            },
+            "operator": operator(),
+            "profiles": ["onym:message-implementation:nostr-courier-v1"],
+            "listedAt": "2026-08-13T00:00:00Z",
+            "relationship": "sponsored-placement",
+            "placement": "sponsored"
+        }, {
+            "componentId": "onym:component:onym-relayer",
+            "seatType": "notary",
+            "manifest": {
+                "uri": "https://relayer.onym.app/manifest.json",
+                "digest": format!("sha256:{}", "55".repeat(32)),
+            },
+            "operator": operator(),
+            "listedAt": "2026-08-13T00:00:00Z",
+            "relationship": "none",
+            "placement": "policy-ranked",
+            "status": {
+                "state": "warning",
+                "uri": "https://discovery.onym.app/status/onym-relayer.md"
+            }
+        }]
+    }))
+    .unwrap();
+    build_snapshot(&config, None, GENERATED_AT, &key(), &fixtures_dir())
+        .unwrap()
+        .bytes
+}
+
+/// §10 item 12: one provider, two catalogs, the same componentId bound
+/// to different manifest digests — provider-level equivocation.
+fn equivocation_manifest_bytes() -> Vec<u8> {
+    let catalog = |id: &str| {
+        json!({
+            "catalogId": id,
+            "snapshot": format!("https://discovery.onym.app/catalogs/{id}.json"),
+            "audience": "public",
+            "seatTypes": ["transport.message"],
+            "policy": format!("sha256:{}", "11".repeat(32)),
+            "policyUri": format!("https://discovery.onym.app/policies/{id}.md"),
+        })
+    };
+    let unsigned = serde_json::to_vec(&json!({
+        "version": 1,
+        "implementationProfileId": IMPLEMENTATION_PROFILE,
+        "providerId": "onym:component:onym-discovery",
+        "operator": operator(),
+        "seat": "discovery",
+        "catalogs": [catalog("catalog-a"), catalog("catalog-b")],
+        "capabilities": ["signed-snapshot-v1", "local-filtering-v1"],
+        "privacyProfile": format!("sha256:{}", "33".repeat(32)),
+        "privacyProfileUri": "https://discovery.onym.app/privacy.md",
+        "offers": [],
+        "validUntil": "2026-12-31T23:59:59Z"
+    }))
+    .unwrap();
+    sign_document(&unsigned, &key()).unwrap()
+}
+
+fn equivocation_snapshot_bytes(catalog_id: &str, digest_byte: &str) -> Vec<u8> {
+    let config: SnapshotConfig = serde_json::from_value(json!({
+        "catalogId": catalog_id,
+        "providerId": "onym:component:onym-discovery",
+        "policyDigest": format!("sha256:{}", "11".repeat(32)),
+        "expiryDays": 30,
+        "entries": [{
+            "componentId": "onym:component:onym-courier",
+            "seatType": "transport.message",
+            "manifest": {
+                "uri": "https://discovery.onym.app/manifests/onym-courier.json",
+                "digest": format!("sha256:{}", digest_byte.repeat(32)),
+            },
+            "operator": operator(),
+            "listedAt": "2026-08-13T00:00:00Z",
+            "relationship": "common-owner",
+            "placement": "policy-ranked"
+        }]
+    }))
+    .unwrap();
+    build_snapshot(&config, None, GENERATED_AT, &key(), &fixtures_dir())
+        .unwrap()
+        .bytes
+}
+
 fn snapshot_config(destination_digest: &str) -> SnapshotConfig {
     let config = json!({
         "catalogId": "public-all-seats",
@@ -124,21 +308,94 @@ fn scrambled_canonical_input() -> &'static [u8] {
     br#"{"zeta": 1, "alpha": {"nested/slash": "a/b", "b": 2, "a": 3}, "signature": "SIG", "mid": [1, 2, 3]}"#
 }
 
+fn case_divergence_input() -> &'static [u8] {
+    // §10 item 1 case-divergence sub-vector: a SYNTHETIC document
+    // whose keys differ only by letter case at a discriminating
+    // position. UTF-8 byte order puts uppercase before lowercase
+    // ("AB" < "Ab" < "aB" < "ab"); a case-insensitive sort
+    // (Foundation's `.sortedKeys`) diverges on exactly this input.
+    br#"{"ab": 1, "aB": 2, "Ab": 3, "AB": 4, "signature": "SIG"}"#
+}
+
+fn escaping_input() -> &'static [u8] {
+    // §10 item 1 escaping sub-vector: every §3 escape class — the
+    // two-character forms, `\u00xx` lowercase-hex control characters,
+    // unescaped `/`, unescaped non-ASCII, and unescaped U+007F.
+    br#"{"controls": "\u0001\u001F", "delete": "\u007F", "quote": "q\"b\\e", "slash": "a/b", "twochar": "\b\f\n\r\t", "unicode": "h\u00E9llo \u2192 \u65E5\u672C", "signature": "SIG"}"#
+}
+
+fn duplicate_keys_input() -> &'static [u8] {
+    // §3: a document with duplicate keys is invalid — at any depth.
+    br#"{"alpha": {"k": 1, "k": 2}, "signature": "SIG"}"#
+}
+
+fn mismatched_detached_sig() -> Vec<u8> {
+    use base64::Engine as _;
+    let mut wrong = [0u8; 64];
+    wrong[0] = 1;
+    let mut out = base64::engine::general_purpose::STANDARD
+        .encode(wrong)
+        .into_bytes();
+    out.push(b'\n');
+    out
+}
+
 #[test]
 fn fixtures_match_or_regenerate() {
     let dir = fixtures_dir();
     std::fs::create_dir_all(&dir).unwrap();
     let (destination, s1, s2, s3) = build_chain();
+    let manifest = provider_manifest_bytes();
+    let manifest_sig = format!("{}\n", detached_signature(&manifest).unwrap()).into_bytes();
     let files: Vec<(&str, Vec<u8>)> = vec![
-        ("provider-manifest.json", provider_manifest_bytes()),
-        ("destination-manifest.json", destination),
+        ("provider-manifest.json", manifest),
+        ("provider-manifest.json.sig", manifest_sig),
+        ("detached-sig-mismatch.sig", mismatched_detached_sig()),
+        ("destination-manifest.json", destination.clone()),
         ("snapshot-1.json", s1),
         ("snapshot-2.json", s2),
         ("snapshot-3.json", s3),
+        (
+            "snapshot-sponsored.json",
+            sponsored_snapshot_bytes(&sha256_digest(&destination)),
+        ),
         ("canonical-input.json", scrambled_canonical_input().to_vec()),
         (
             "canonical-bytes.bin",
             signing_bytes(scrambled_canonical_input()).unwrap(),
+        ),
+        (
+            "canonical-case-input.json",
+            case_divergence_input().to_vec(),
+        ),
+        (
+            "canonical-case-bytes.bin",
+            signing_bytes(case_divergence_input()).unwrap(),
+        ),
+        ("canonical-escaping-input.json", escaping_input().to_vec()),
+        (
+            "canonical-escaping-bytes.bin",
+            signing_bytes(escaping_input()).unwrap(),
+        ),
+        ("duplicate-keys-input.json", duplicate_keys_input().to_vec()),
+        (
+            "policy-transition-manifest.json",
+            transition_manifest_bytes(),
+        ),
+        (
+            "audience-skip-manifest.json",
+            audience_skip_manifest_bytes(),
+        ),
+        ("conflict-provider-b.json", conflict_provider_bytes()),
+        ("conflict-snapshot-b.json", conflict_snapshot_bytes()),
+        ("equivocation-manifest.json", equivocation_manifest_bytes()),
+        (
+            "equivocation-snapshot-a.json",
+            equivocation_snapshot_bytes("catalog-a", "66"),
+        ),
+        (
+            "equivocation-snapshot-b.json",
+            equivocation_snapshot_bytes("catalog-b", "77"),
         ),
     ];
     for (name, bytes) in files {
@@ -161,9 +418,23 @@ fn valid_chain_verifies() {
     let v1 = verify_snapshot(&s1, &manifest, None, VERIFY_AT).unwrap();
     assert_eq!(v1.snapshot.sequence, 1);
     assert_eq!(v1.entries.len(), 1);
-    let v2 = verify_snapshot(&s2, &manifest, Some(&s1), VERIFY_AT).unwrap();
+    assert_eq!(v1.outcome, ChainOutcome::FirstAcceptance);
+    let v2 = verify_snapshot(&s2, &manifest, Some(&retained(&s1)), VERIFY_AT).unwrap();
     assert_eq!(v2.snapshot.sequence, 2);
-    verify_snapshot(&s3, &manifest, Some(&s2), VERIFY_AT).unwrap();
+    assert_eq!(v2.outcome, ChainOutcome::Successor);
+    verify_snapshot(&s3, &manifest, Some(&retained(&s2)), VERIFY_AT).unwrap();
+}
+
+#[test]
+fn first_acceptance_takes_any_sequence() {
+    // §6: on first acceptance of a source there is no retained state
+    // to compare against — an established catalog past its first
+    // snapshot must be addable (TOFU covers trust).
+    let manifest = verify_manifest(&provider_manifest_bytes(), VERIFY_AT).unwrap();
+    let (_, _, _, s3) = build_chain();
+    let v3 = verify_snapshot(&s3, &manifest, None, VERIFY_AT).unwrap();
+    assert_eq!(v3.snapshot.sequence, 3);
+    assert_eq!(v3.outcome, ChainOutcome::FirstAcceptance);
 }
 
 #[test]
@@ -182,6 +453,15 @@ fn destination_digest_binds_bytes() {
 }
 
 #[test]
+fn oversize_destination_is_unavailable_not_mismatch() {
+    // §9 pins the oversize destination manifest to
+    // entry_manifest_unavailable.
+    let oversized = vec![b'x'; MAX_DESTINATION_MANIFEST_BYTES + 1];
+    let err = verify_destination(&oversized, &format!("sha256:{}", "11".repeat(32))).unwrap_err();
+    assert_eq!(err.code(), Some("entry_manifest_unavailable"));
+}
+
+#[test]
 fn bad_signature_rejected() {
     let mut raw: Value = serde_json::from_slice(&provider_manifest_bytes()).unwrap();
     let sig = raw["signature"].as_str().unwrap().to_owned();
@@ -197,21 +477,52 @@ fn rekeyed_manifest_rejected() {
     // Same content, signed by a different key than `operator` names.
     let mut raw: Value = serde_json::from_slice(&provider_manifest_bytes()).unwrap();
     raw.as_object_mut().unwrap().remove("signature");
-    let other = keys::signing_key_from_seed_hex(OTHER_SEED_HEX).unwrap();
-    let resigned = sign_document(&serde_json::to_vec(&raw).unwrap(), &other).unwrap();
+    let resigned = sign_document(&serde_json::to_vec(&raw).unwrap(), &other_key()).unwrap();
     let err = verify_manifest(&resigned, VERIFY_AT).unwrap_err();
     assert_eq!(err.code(), Some("provider_manifest_invalid"));
 }
 
 #[test]
-fn sequence_rollback_and_gap_rejected() {
+fn sequence_rollback_rejected() {
     let manifest = verify_manifest(&provider_manifest_bytes(), VERIFY_AT).unwrap();
-    let (_, s1, s2, s3) = build_chain();
+    let (_, s1, s2, _) = build_chain();
     // Rollback: sequence 1 presented after sequence 2 was accepted.
-    let err = verify_snapshot(&s1, &manifest, Some(&s2), VERIFY_AT).unwrap_err();
+    let err = verify_snapshot(&s1, &manifest, Some(&retained(&s2)), VERIFY_AT).unwrap_err();
     assert_eq!(err.code(), Some("snapshot_invalid"));
-    // Gap: sequence 3 with sequence 1 as predecessor.
-    let err = verify_snapshot(&s3, &manifest, Some(&s1), VERIFY_AT).unwrap_err();
+}
+
+#[test]
+fn forward_jump_accepted_with_note() {
+    // §6/§10 item 8: sequence N against a retained N−2 — accepted,
+    // carrying the source-integrity note (the offline verifier does
+    // not perform the intermediate-fetch continuity walk).
+    let manifest = verify_manifest(&provider_manifest_bytes(), VERIFY_AT).unwrap();
+    let (_, s1, _, s3) = build_chain();
+    let v = verify_snapshot(&s3, &manifest, Some(&retained(&s1)), VERIFY_AT).unwrap();
+    assert_eq!(v.outcome, ChainOutcome::ForwardJumpWithNote { missed: 1 });
+}
+
+#[test]
+fn no_op_refresh_is_not_a_warning() {
+    // §6/§10 item 11: identical latest snapshot re-fetched — the
+    // provider simply hasn't published since; no warning.
+    let manifest = verify_manifest(&provider_manifest_bytes(), VERIFY_AT).unwrap();
+    let (_, _, s2, _) = build_chain();
+    let v = verify_snapshot(&s2, &manifest, Some(&retained(&s2)), VERIFY_AT).unwrap();
+    assert_eq!(v.outcome, ChainOutcome::NoOpRefresh);
+}
+
+#[test]
+fn same_sequence_fork_rejected() {
+    // Fork: same sequence, different bytes — equivocation, never
+    // silently resolved toward either side.
+    let manifest = verify_manifest(&provider_manifest_bytes(), VERIFY_AT).unwrap();
+    let (_, _, s2, _) = build_chain();
+    let mut doc: Value = serde_json::from_slice(&s2).unwrap();
+    doc.as_object_mut().unwrap().remove("signature");
+    doc["expiresAt"] = json!("2026-09-13T00:00:00Z");
+    let forked = sign_document(&serde_json::to_vec(&doc).unwrap(), &key()).unwrap();
+    let err = verify_snapshot(&forked, &manifest, Some(&retained(&s2)), VERIFY_AT).unwrap_err();
     assert_eq!(err.code(), Some("snapshot_invalid"));
 }
 
@@ -219,13 +530,65 @@ fn sequence_rollback_and_gap_rejected() {
 fn forked_previous_digest_rejected() {
     let manifest = verify_manifest(&provider_manifest_bytes(), VERIFY_AT).unwrap();
     let (_, s1, s2, _) = build_chain();
-    // A fork: same sequence 2, but previousDigest pointing elsewhere.
+    // A fork: sequence 2, but previousDigest pointing elsewhere.
     let mut fork: Value = serde_json::from_slice(&s2).unwrap();
     fork.as_object_mut().unwrap().remove("signature");
     fork["previousDigest"] = Value::String(format!("sha256:{}", "22".repeat(32)));
     let forked = sign_document(&serde_json::to_vec(&fork).unwrap(), &key()).unwrap();
-    let err = verify_snapshot(&forked, &manifest, Some(&s1), VERIFY_AT).unwrap_err();
+    let err = verify_snapshot(&forked, &manifest, Some(&retained(&s1)), VERIFY_AT).unwrap_err();
     assert_eq!(err.code(), Some("snapshot_invalid"));
+}
+
+#[test]
+fn policy_transition_grace() {
+    // §4.2/§10 item 10: manifest updated to a new policy digest, the
+    // snapshot still citing the previous one — accepted with the
+    // transition note; any third digest fails.
+    let manifest = verify_manifest(&transition_manifest_bytes(), VERIFY_AT).unwrap();
+    let (_, s1, ..) = build_chain();
+    // Without the retained previous declaration: snapshot_invalid.
+    let err = verify_snapshot(&s1, &manifest, None, VERIFY_AT).unwrap_err();
+    assert_eq!(err.code(), Some("snapshot_invalid"));
+    // With it: accepted, transition surfaced.
+    let mut state = retained(&s1);
+    state.previous_policy = Some(format!("sha256:{}", "11".repeat(32)));
+    let v = verify_snapshot(&s1, &manifest, Some(&state), VERIFY_AT).unwrap();
+    assert!(v.policy_transition);
+    // A third digest matches neither: snapshot_invalid.
+    let mut third = retained(&s1);
+    third.previous_policy = Some(format!("sha256:{}", "99".repeat(32)));
+    let err = verify_snapshot(&s1, &manifest, Some(&third), VERIFY_AT).unwrap_err();
+    assert_eq!(err.code(), Some("snapshot_invalid"));
+}
+
+#[test]
+fn audience_skip_manifest_is_valid_and_empty() {
+    // §1/§10 item 13: a manifest of decodable but non-public catalogs
+    // is a valid, empty-by-policy source; the skip count is surfaced.
+    let verified = verify_manifest(&audience_skip_manifest_bytes(), VERIFY_AT).unwrap();
+    assert!(verified.catalogs.is_empty());
+    assert_eq!(verified.audience_skipped, vec![0]);
+    assert!(verified.skipped.is_empty());
+}
+
+#[test]
+fn invalid_seat_types_member_skips_descriptor() {
+    // §4.1: a member that is neither a token nor the lone wildcard
+    // skips the descriptor; "*" must appear alone.
+    let mut doc: Value = serde_json::from_slice(&provider_manifest_bytes()).unwrap();
+    doc.as_object_mut().unwrap().remove("signature");
+    let mut bad = doc["catalogs"][0].clone();
+    bad["catalogId"] = json!("bad-members");
+    bad["seatTypes"] = json!(["Notary!"]);
+    let mut wildcard = doc["catalogs"][0].clone();
+    wildcard["catalogId"] = json!("wildcard-not-alone");
+    wildcard["seatTypes"] = json!(["*", "notary"]);
+    doc["catalogs"].as_array_mut().unwrap().push(bad);
+    doc["catalogs"].as_array_mut().unwrap().push(wildcard);
+    let signed = sign_document(&serde_json::to_vec(&doc).unwrap(), &key()).unwrap();
+    let verified = verify_manifest(&signed, VERIFY_AT).unwrap();
+    assert_eq!(verified.catalogs.len(), 1);
+    assert_eq!(verified.skipped, vec![1, 2]);
 }
 
 #[test]
@@ -267,6 +630,127 @@ fn malformed_entry_skipped_not_fatal() {
 }
 
 #[test]
+fn sponsored_disclosure_and_status_survive() {
+    // §10 item 6 + §4.2 status: the sponsored-placement disclosure and
+    // a valid warning status must SURVIVE decoding — an entry carrying
+    // a valid status is never skipped (skipping it is the exact
+    // warning-dropping failure the field exists to prevent).
+    let manifest = verify_manifest(&provider_manifest_bytes(), VERIFY_AT).unwrap();
+    let raw = sponsored_snapshot_bytes(&sha256_digest(&destination_manifest_bytes()));
+    let verified = verify_snapshot(&raw, &manifest, None, VERIFY_AT).unwrap();
+    assert_eq!(verified.entries.len(), 2);
+    assert!(verified.skipped.is_empty());
+    assert_eq!(verified.entries[0].relationship, "sponsored-placement");
+    assert_eq!(verified.entries[0].placement, "sponsored");
+    let status = verified.entries[1].status.as_ref().unwrap();
+    assert_eq!(status.state, "warning");
+    assert!(status.uri.is_some());
+}
+
+#[test]
+fn invalid_status_or_nonempty_evidence_skips_entry() {
+    let (_, s1, ..) = build_chain();
+    let manifest = verify_manifest(&provider_manifest_bytes(), VERIFY_AT).unwrap();
+    for tamper in [
+        json!({"state": "suspended"}),
+        json!({"state": "warning", "uri": "http://insecure.example/x"}),
+        json!("warning"),
+    ] {
+        let mut doc: Value = serde_json::from_slice(&s1).unwrap();
+        doc.as_object_mut().unwrap().remove("signature");
+        doc["entries"][0]["status"] = tamper;
+        let signed = sign_document(&serde_json::to_vec(&doc).unwrap(), &key()).unwrap();
+        let verified = verify_snapshot(&signed, &manifest, None, VERIFY_AT).unwrap();
+        assert!(verified.entries.is_empty());
+        assert_eq!(verified.skipped, vec![0]);
+    }
+    // §4.2: non-empty evidence is deferred to v2; the entry is
+    // skipped, never passed through as an unrenderable attestation.
+    let mut doc: Value = serde_json::from_slice(&s1).unwrap();
+    doc.as_object_mut().unwrap().remove("signature");
+    doc["entries"][0]["evidence"] = json!([{"type": "audit", "uri": "https://x.example/a", "digest": format!("sha256:{}", "11".repeat(32))}]);
+    let signed = sign_document(&serde_json::to_vec(&doc).unwrap(), &key()).unwrap();
+    let verified = verify_snapshot(&signed, &manifest, None, VERIFY_AT).unwrap();
+    assert!(verified.entries.is_empty());
+    assert_eq!(verified.skipped, vec![0]);
+}
+
+#[test]
+fn unknown_relationship_skips_entry() {
+    // §4.2 fails closed against the extensible relationship set: a
+    // disclosure the client cannot render is one the user never saw.
+    let (_, s1, ..) = build_chain();
+    let manifest = verify_manifest(&provider_manifest_bytes(), VERIFY_AT).unwrap();
+    let mut doc: Value = serde_json::from_slice(&s1).unwrap();
+    doc.as_object_mut().unwrap().remove("signature");
+    doc["entries"][0]["relationship"] = json!("equity-stake");
+    let signed = sign_document(&serde_json::to_vec(&doc).unwrap(), &key()).unwrap();
+    let verified = verify_snapshot(&signed, &manifest, None, VERIFY_AT).unwrap();
+    assert!(verified.entries.is_empty());
+    assert_eq!(verified.skipped, vec![0]);
+}
+
+#[test]
+fn source_conflict_pair_detected() {
+    // §10 item 7: two providers bind the same componentId to different
+    // manifest digests — both claims preserved, conflict surfaced.
+    let manifest_a = verify_manifest(&provider_manifest_bytes(), VERIFY_AT).unwrap();
+    let (_, s1, ..) = build_chain();
+    let a = verify_snapshot(&s1, &manifest_a, None, VERIFY_AT).unwrap();
+    let manifest_b = verify_manifest(&conflict_provider_bytes(), VERIFY_AT).unwrap();
+    let b = verify_snapshot(&conflict_snapshot_bytes(), &manifest_b, None, VERIFY_AT).unwrap();
+    assert_eq!(
+        source_conflicts(&a.entries, &b.entries),
+        vec!["onym:component:onym-courier".to_string()]
+    );
+    // No conflict against itself.
+    assert!(source_conflicts(&a.entries, &a.entries).is_empty());
+}
+
+#[test]
+fn cross_catalog_equivocation_surfaced() {
+    // §4.2/§10 item 12: one provider, two catalogs, one componentId,
+    // two digests — the cheapest equivocation must not be the one
+    // nobody checks.
+    let manifest = verify_manifest(&equivocation_manifest_bytes(), VERIFY_AT).unwrap();
+    let a = verify_snapshot(
+        &equivocation_snapshot_bytes("catalog-a", "66"),
+        &manifest,
+        None,
+        VERIFY_AT,
+    )
+    .unwrap();
+    let b = verify_snapshot(
+        &equivocation_snapshot_bytes("catalog-b", "77"),
+        &manifest,
+        None,
+        VERIFY_AT,
+    )
+    .unwrap();
+    assert_eq!(
+        cross_catalog_equivocation(&[&a, &b]),
+        vec!["onym:component:onym-courier".to_string()]
+    );
+}
+
+#[test]
+fn detached_sig_agreement_fails_closed() {
+    // §3/§10 item 14: embedded and detached forms must decode to the
+    // same 64 bytes; disagreement fails closed for the document.
+    let manifest = provider_manifest_bytes();
+    let good = format!("{}\n", detached_signature(&manifest).unwrap());
+    verify_detached_sig(&manifest, good.as_bytes(), false).unwrap();
+    let err = verify_detached_sig(&manifest, &mismatched_detached_sig(), false).unwrap_err();
+    assert_eq!(err.code(), Some("provider_manifest_invalid"));
+    let (_, s1, ..) = build_chain();
+    let err = verify_detached_sig(&s1, &mismatched_detached_sig(), true).unwrap_err();
+    assert_eq!(err.code(), Some("snapshot_invalid"));
+    // Padding differences are not disagreement: compare after decode.
+    let unpadded = good.trim_end().trim_end_matches('=').to_string();
+    verify_detached_sig(&manifest, unpadded.as_bytes(), false).unwrap();
+}
+
+#[test]
 fn uri_rules_enforced() {
     for bad in [
         "http://discovery.onym.app/catalog.json",
@@ -276,10 +760,35 @@ fn uri_rules_enforced() {
         "https://[::1]/catalog.json",
         "https://user@discovery.onym.app/catalog.json",
         "https://discovery.onym.app:8443/catalog.json",
+        // §7: the RAW string must not carry a port component — URL
+        // libraries normalize a redundant `:443` away before any
+        // parsed-port check is reachable.
+        "https://discovery.onym.app:443/catalog.json",
+        // Integer-form IPv4 literal.
+        "https://3232235777/catalog.json",
+        // Hex/dotted-integer IPv4 forms.
+        "https://0xc0a80101/catalog.json",
     ] {
         assert!(validate_uri(bad).is_err(), "{bad} should be rejected");
     }
     validate_uri("https://discovery.onym.app/catalogs/public.json").unwrap();
+}
+
+#[test]
+fn duplicate_keys_rejected() {
+    // §3: duplicate keys, at any depth, make the document invalid —
+    // never last-key-wins.
+    assert!(reject_duplicate_keys(duplicate_keys_input()).is_err());
+    assert!(signing_bytes(duplicate_keys_input()).is_err());
+    assert!(reject_duplicate_keys(br#"{"a": 1, "b": [{"c": 1, "c": 1}]}"#).is_err());
+    reject_duplicate_keys(br#"{"a": {"x": 1}, "b": {"x": 1}}"#).unwrap();
+    // A duplicate-key provider manifest is provider_manifest_invalid.
+    let mut doc = provider_manifest_bytes();
+    let insert_at = doc.len() - 1;
+    let dup = br#","version":1"#;
+    doc.splice(insert_at..insert_at, dup.iter().copied());
+    let err = verify_manifest(&doc, VERIFY_AT).unwrap_err();
+    assert_eq!(err.code(), Some("provider_manifest_invalid"));
 }
 
 #[test]
@@ -319,6 +828,30 @@ fn canonicalization_sorts_and_preserves_slashes() {
 }
 
 #[test]
+fn canonical_case_divergence_vector() {
+    // §3/§10 item 1: the sort is UTF-8 byte order — uppercase before
+    // lowercase. A case-insensitive sort fails exactly here.
+    let canonical = signing_bytes(case_divergence_input()).unwrap();
+    let expected = br#"{"AB":4,"Ab":3,"aB":2,"ab":1}"#;
+    assert_eq!(canonical, expected);
+}
+
+#[test]
+fn canonical_escaping_vector() {
+    // §3/§10 item 1: escaping is pinned — two-char forms, lowercase
+    // \u00xx for remaining controls, and NOTHING else escaped: no `/`,
+    // no non-ASCII, no U+007F.
+    let canonical = signing_bytes(escaping_input()).unwrap();
+    let text = String::from_utf8(canonical.clone()).unwrap();
+    assert!(text.contains(r#""controls":"\u0001\u001f""#), "{text}");
+    assert!(text.contains("\"delete\":\"\u{7f}\""), "{text}");
+    assert!(text.contains(r#""quote":"q\"b\\e""#), "{text}");
+    assert!(text.contains(r#""slash":"a/b""#), "{text}");
+    assert!(text.contains(r#""twochar":"\b\f\n\r\t""#), "{text}");
+    assert!(text.contains("\"unicode\":\"héllo → 日本\""), "{text}");
+}
+
+#[test]
 fn oversize_snapshot_rejected() {
     let manifest = verify_manifest(&provider_manifest_bytes(), VERIFY_AT).unwrap();
     let padding = "x".repeat(MAX_SNAPSHOT_BYTES);
@@ -333,6 +866,10 @@ fn error_matches_expected_variant() {
     assert_eq!(
         Error::EntryManifestMismatch(String::new()).code(),
         Some("entry_manifest_mismatch")
+    );
+    assert_eq!(
+        Error::EntryManifestUnavailable(String::new()).code(),
+        Some("entry_manifest_unavailable")
     );
     assert_eq!(Error::Malformed(String::new()).code(), None);
 }
@@ -355,7 +892,7 @@ fn unknown_key_descriptor_skipped_not_fatal() {
 }
 
 #[test]
-fn zero_surviving_descriptors_invalid() {
+fn zero_decodable_descriptors_invalid() {
     // §4.1: a manifest whose descriptors all fail lossy decode is
     // provider_manifest_invalid, never an empty-but-valid source.
     let mut doc: Value = serde_json::from_slice(&provider_manifest_bytes()).unwrap();

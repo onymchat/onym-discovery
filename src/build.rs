@@ -129,6 +129,23 @@ fn resolve_entry(raw_entry: &Value, config_dir: &std::path::Path) -> Result<Valu
             decoded.relationship
         )));
     }
+    // §4.2: evidence must be absent or empty in v1; status, when
+    // present, must be a renderable warning/review state. A builder
+    // must not emit entries a conforming verifier would skip.
+    if !decoded.evidence.is_empty() {
+        return Err(Error::Malformed("evidence must be empty in v1".into()));
+    }
+    if let Some(status) = &decoded.status {
+        if !STATUS_STATES.contains(&status.state.as_str()) {
+            return Err(Error::Malformed(format!(
+                "unknown status state {}",
+                status.state
+            )));
+        }
+        if let Some(uri) = &status.uri {
+            validate_uri(uri)?;
+        }
+    }
     // Re-serialize through the typed struct so field order and shape
     // are deterministic regardless of config formatting.
     serde_json::to_value(&decoded).map_err(|e| Error::Internal(e.to_string()))

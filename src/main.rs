@@ -8,7 +8,10 @@ use onym_discovery::build::{build_snapshot, SnapshotConfig};
 use onym_discovery::keys;
 use onym_discovery::sign::{detached_signature, sign_document};
 use onym_discovery::types::parse_timestamp;
-use onym_discovery::verify::{sha256_digest, verify_destination, verify_manifest, verify_snapshot};
+use onym_discovery::verify::{
+    sha256_digest, verify_destination, verify_manifest, verify_snapshot, ChainOutcome,
+    RetainedCatalogState,
+};
 
 #[derive(Parser)]
 #[command(
@@ -174,6 +177,15 @@ fn main() -> Result<()> {
             std::fs::write(&out, &built.bytes)?;
             let sig = detached_signature(&built.bytes)?;
             std::fs::write(sig_path(&out), format!("{sig}\n"))?;
+            // §5 retention: every snapshot is also published as the
+            // flat sibling `<catalogId>-<sequence>.json`, so that a
+            // client observing a forward jump can walk the chain while
+            // superseded snapshots have not yet expired.
+            let retention =
+                out.with_file_name(format!("{}-{}.json", parsed.catalog_id, built.sequence));
+            std::fs::write(&retention, &built.bytes)?;
+            std::fs::write(sig_path(&retention), format!("{sig}\n"))?;
+            println!("retention sibling {}", retention.display());
             println!(
                 "wrote {} (sequence {}, {} bytes, digest {})",
                 out.display(),
@@ -206,12 +218,14 @@ fn main() -> Result<()> {
                     std::fs::read(&manifest).with_context(|| manifest.display().to_string())?;
                 let now = moment(&at)?;
                 let parsed_manifest = verify_manifest(&manifest_raw, now)?;
-                let previous_raw = previous
+                let retained = previous
                     .as_ref()
-                    .map(|p| std::fs::read(p).with_context(|| p.display().to_string()))
+                    .map(|p| -> Result<RetainedCatalogState> {
+                        let bytes = std::fs::read(p).with_context(|| p.display().to_string())?;
+                        Ok(RetainedCatalogState::from_snapshot_bytes(&bytes)?)
+                    })
                     .transpose()?;
-                let verified =
-                    verify_snapshot(&raw, &parsed_manifest, previous_raw.as_deref(), now)?;
+                let verified = verify_snapshot(&raw, &parsed_manifest, retained.as_ref(), now)?;
                 println!(
                     "OK {} sequence {} — {} entries ({} skipped), digest {}",
                     verified.snapshot.catalog_id,
@@ -220,6 +234,17 @@ fn main() -> Result<()> {
                     verified.skipped.len(),
                     verified.digest
                 );
+                match verified.outcome {
+                    ChainOutcome::NoOpRefresh => println!("note: no-op refresh (unchanged bytes)"),
+                    ChainOutcome::ForwardJumpWithNote { missed } => println!(
+                        "note: forward jump — {missed} intermediate publication(s) \
+                         not verified (source-integrity note)"
+                    ),
+                    ChainOutcome::FirstAcceptance | ChainOutcome::Successor => {}
+                }
+                if verified.policy_transition {
+                    println!("note: policyDigest cites the previous policy declaration (transition grace)");
+                }
             }
             VerifyCommand::Destination { file, digest } => {
                 let raw = std::fs::read(&file).with_context(|| file.display().to_string())?;

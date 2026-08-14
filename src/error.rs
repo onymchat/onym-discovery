@@ -14,6 +14,8 @@ pub enum Error {
     SnapshotExpired(String),
     #[error("entry_manifest_mismatch: {0}")]
     EntryManifestMismatch(String),
+    #[error("entry_manifest_unavailable: {0}")]
+    EntryManifestUnavailable(String),
     #[error("malformed input: {0}")]
     Malformed(String),
     #[error("internal: {0}")]
@@ -30,6 +32,7 @@ impl Error {
             Error::SnapshotInvalid(_) => Some("snapshot_invalid"),
             Error::SnapshotExpired(_) => Some("snapshot_expired"),
             Error::EntryManifestMismatch(_) => Some("entry_manifest_mismatch"),
+            Error::EntryManifestUnavailable(_) => Some("entry_manifest_unavailable"),
             _ => None,
         }
     }

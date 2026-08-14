@@ -22,6 +22,12 @@ pub struct VerifiedManifest {
     /// Indexes of `catalogs[]` descriptors that were skipped (unknown
     /// keys or otherwise malformed) — surfaced, never silently dropped.
     pub skipped: Vec<usize>,
+    /// Indexes of descriptors that decoded but whose `audience` is not
+    /// exactly `"public"` — skipped per §1, surfaced in the source's
+    /// skipped-catalog count, and NOT counted toward manifest
+    /// invalidity (a manifest of all-non-public catalogs is a valid,
+    /// empty-by-policy source).
+    pub audience_skipped: Vec<usize>,
 }
 
 /// Verify a provider manifest's schema, fields, expiry, and
@@ -62,23 +68,32 @@ pub fn verify_manifest(raw: &[u8], now: OffsetDateTime) -> Result<VerifiedManife
     // document-fatal; zero surviving descriptors is fatal.
     let mut catalogs = Vec::new();
     let mut skipped = Vec::new();
+    let mut audience_skipped = Vec::new();
+    let mut decoded_ids = std::collections::BTreeSet::new();
     for (index, value) in manifest.catalogs.iter().enumerate() {
         match decode_descriptor(value) {
-            Ok(descriptor) => catalogs.push(descriptor),
+            Ok(descriptor) => {
+                // Duplicate detection runs over every DECODED
+                // descriptor, audience-skipped or not (§4.1).
+                if !decoded_ids.insert(descriptor.catalog_id.clone()) {
+                    return Err(invalid(format!(
+                        "duplicate catalogId {}",
+                        descriptor.catalog_id
+                    )));
+                }
+                if descriptor.audience != "public" {
+                    // §1: non-public catalogs are skipped, never a
+                    // soft private-catalog path and never invalidity.
+                    audience_skipped.push(index);
+                } else {
+                    catalogs.push(descriptor);
+                }
+            }
             Err(_) => skipped.push(index),
         }
     }
-    if catalogs.is_empty() {
-        return Err(invalid("no surviving catalog descriptors".into()));
-    }
-    let mut seen = std::collections::BTreeSet::new();
-    for catalog in &catalogs {
-        if !seen.insert(catalog.catalog_id.clone()) {
-            return Err(invalid(format!(
-                "duplicate catalogId {}",
-                catalog.catalog_id
-            )));
-        }
+    if decoded_ids.is_empty() {
+        return Err(invalid("no decodable catalog descriptors".into()));
     }
     validate_uri(&manifest.privacy_profile_uri).map_err(|e| invalid(e.to_string()))?;
     validate_digest(&manifest.privacy_profile).map_err(|e| invalid(e.to_string()))?;
@@ -102,6 +117,7 @@ pub fn verify_manifest(raw: &[u8], now: OffsetDateTime) -> Result<VerifiedManife
         manifest,
         catalogs,
         skipped,
+        audience_skipped,
     })
 }
 
@@ -113,7 +129,63 @@ fn decode_descriptor(value: &Value) -> Result<CatalogDescriptor, Error> {
     validate_uri(&descriptor.snapshot)?;
     validate_digest(&descriptor.policy)?;
     validate_uri(&descriptor.policy_uri)?;
+    // §4.1: members are seat-type tokens or the lone `"*"` wildcard; a
+    // member matching neither form skips the descriptor (one lossiness
+    // model per level).
+    for member in &descriptor.seat_types {
+        validate_seat_type_member(member)?;
+    }
+    if descriptor.seat_types.iter().any(|m| m == "*") && descriptor.seat_types.len() > 1 {
+        return Err(Error::Malformed(
+            "\"*\" must appear alone in seatTypes".into(),
+        ));
+    }
     Ok(descriptor)
+}
+
+/// What the client retains per `(providerId, catalogId)` between
+/// refreshes (§8): the last accepted snapshot's sequence and digest,
+/// plus the catalog's previously declared `policy` digest (the §4.2
+/// one-generation transition grace).
+#[derive(Debug, Clone)]
+pub struct RetainedCatalogState {
+    pub sequence: u64,
+    pub digest: String,
+    pub previous_policy: Option<String>,
+}
+
+impl RetainedCatalogState {
+    /// Derive retained state from the exact bytes of a previously
+    /// accepted snapshot.
+    pub fn from_snapshot_bytes(raw: &[u8]) -> Result<Self, Error> {
+        let snapshot: CatalogSnapshot = serde_json::from_slice(raw)
+            .map_err(|e| Error::Malformed(format!("previous snapshot: {e}")))?;
+        Ok(RetainedCatalogState {
+            sequence: snapshot.sequence,
+            digest: sha256_digest(raw),
+            previous_policy: None,
+        })
+    }
+}
+
+/// §6's four-case chain comparison outcome for an ACCEPTED snapshot
+/// (rollback and fork are rejections, not outcomes).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ChainOutcome {
+    /// No retained state: first acceptance of this catalog. Any
+    /// sequence is accepted — TOFU pinning covers trust, and an
+    /// established catalog past its first snapshot must be addable.
+    FirstAcceptance,
+    /// `sequence` = retained + 1 with matching `previousDigest`.
+    Successor,
+    /// Same sequence, same bytes: the provider simply hasn't published
+    /// since. No warning.
+    NoOpRefresh,
+    /// `sequence` more than retained + 1: accepted with a
+    /// source-integrity note (§6). The intermediate-fetch continuity
+    /// walk is a fetch-side obligation this offline verifier does not
+    /// perform — gap-listed in the profile's §11.
+    ForwardJumpWithNote { missed: u64 },
 }
 
 #[derive(Debug)]
@@ -123,14 +195,19 @@ pub struct VerifiedSnapshot {
     /// Indexes of entries that failed lossy decoding and were skipped.
     pub skipped: Vec<usize>,
     pub digest: String,
+    pub outcome: ChainOutcome,
+    /// True when `policyDigest` matched the retained PREVIOUS policy
+    /// declaration rather than the manifest's current one — accepted
+    /// with a surfaced policy-transition note (§4.2).
+    pub policy_transition: bool,
 }
 
 /// Verify a snapshot against its provider manifest and, when given,
-/// the exact bytes of the previously accepted snapshot.
+/// the retained per-catalog acceptance state (§6/§8).
 pub fn verify_snapshot(
     raw: &[u8],
     manifest: &VerifiedManifest,
-    previous_raw: Option<&[u8]>,
+    retained: Option<&RetainedCatalogState>,
     now: OffsetDateTime,
 ) -> Result<VerifiedSnapshot, Error> {
     if raw.len() > MAX_SNAPSHOT_BYTES {
@@ -165,13 +242,27 @@ pub fn verify_snapshot(
             ))
         })?;
     validate_digest(&snapshot.policy_digest).map_err(|e| invalid(e.to_string()))?;
+    // §4.2 policy-transition grace: the snapshot's policyDigest must
+    // match the manifest's current declaration OR the immediately
+    // previous declaration the client retained — accepted with a
+    // surfaced transition note. Any other digest is snapshot_invalid.
+    let mut policy_transition = false;
     if snapshot.policy_digest != descriptor.policy {
-        return Err(invalid(
-            "policyDigest does not match manifest's pinned policy".into(),
-        ));
+        match retained.and_then(|r| r.previous_policy.as_deref()) {
+            Some(previous) if previous == snapshot.policy_digest => {
+                policy_transition = true;
+            }
+            _ => {
+                return Err(invalid(
+                    "policyDigest matches neither the manifest's pinned policy \
+                     nor the retained previous declaration"
+                        .into(),
+                ))
+            }
+        }
     }
 
-    // Chain rules.
+    // Chain rules (structural).
     if snapshot.sequence == 0 {
         return Err(invalid("sequence starts at 1".into()));
     }
@@ -186,27 +277,46 @@ pub fn verify_snapshot(
             .ok_or_else(|| invalid("sequence > 1 requires previousDigest".into()))?;
         validate_digest(prev_digest).map_err(|e| invalid(e.to_string()))?;
     }
-    if let Some(previous_raw) = previous_raw {
-        let previous: CatalogSnapshot = serde_json::from_slice(previous_raw)
-            .map_err(|e| invalid(format!("previous snapshot: {e}")))?;
-        if previous.catalog_id != snapshot.catalog_id {
-            return Err(invalid(
-                "previous snapshot is for a different catalog".into(),
-            ));
+    // §6 four-case comparison against the retained acceptance.
+    let digest = sha256_digest(raw);
+    let outcome = match retained {
+        None => ChainOutcome::FirstAcceptance,
+        Some(r) => {
+            if snapshot.sequence < r.sequence {
+                // Rollback.
+                return Err(invalid(format!(
+                    "rollback: sequence {} after accepted {}",
+                    snapshot.sequence, r.sequence
+                )));
+            } else if snapshot.sequence == r.sequence {
+                if digest == r.digest {
+                    ChainOutcome::NoOpRefresh
+                } else {
+                    // Fork: same sequence, different bytes.
+                    return Err(invalid(format!(
+                        "fork: sequence {} republished with different bytes",
+                        snapshot.sequence
+                    )));
+                }
+            } else if snapshot.sequence == r.sequence + 1 {
+                if snapshot.previous_digest.as_deref() != Some(r.digest.as_str()) {
+                    // Fork: successor that does not chain onto the
+                    // retained acceptance.
+                    return Err(invalid(
+                        "fork: previousDigest does not match retained snapshot digest".into(),
+                    ));
+                }
+                ChainOutcome::Successor
+            } else {
+                // Forward jump: accepted with a source-integrity note.
+                // The §6 intermediate continuity walk is fetch-side
+                // and not performed by this offline verifier.
+                ChainOutcome::ForwardJumpWithNote {
+                    missed: snapshot.sequence - r.sequence - 1,
+                }
+            }
         }
-        if snapshot.sequence != previous.sequence + 1 {
-            return Err(invalid(format!(
-                "sequence must increase by 1: previous {} → {}",
-                previous.sequence, snapshot.sequence
-            )));
-        }
-        let expected = sha256_digest(previous_raw);
-        if snapshot.previous_digest.as_deref() != Some(expected.as_str()) {
-            return Err(invalid(
-                "previousDigest does not match previous snapshot bytes".into(),
-            ));
-        }
-    }
+    };
 
     // Freshness.
     let generated_at =
@@ -277,7 +387,9 @@ pub fn verify_snapshot(
         snapshot,
         entries,
         skipped,
-        digest: sha256_digest(raw),
+        digest,
+        outcome,
+        policy_transition,
     })
 }
 
@@ -304,9 +416,25 @@ fn decode_entry(value: &Value) -> Result<CatalogEntry, Error> {
     if entry.placement.is_empty() {
         return Err(Error::Malformed("empty placement".into()));
     }
-    for evidence in &entry.evidence {
-        validate_uri(&evidence.uri)?;
-        validate_digest(&evidence.digest)?;
+    // §4.2: evidence must be absent or empty in v1 — a non-empty
+    // evidence array skips the entry (unrenderable attestation).
+    if !entry.evidence.is_empty() {
+        return Err(Error::Malformed("non-empty evidence in v1".into()));
+    }
+    // §4.2: status, when present, is {state: warning|review, uri?};
+    // anything else is undecodable and skips the entry. A VALID status
+    // must not skip the entry — it is exactly the warning the field
+    // exists to surface.
+    if let Some(status) = &entry.status {
+        if !STATUS_STATES.contains(&status.state.as_str()) {
+            return Err(Error::Malformed(format!(
+                "unknown status state {}",
+                status.state
+            )));
+        }
+        if let Some(uri) = &status.uri {
+            validate_uri(uri)?;
+        }
     }
     Ok(entry)
 }
@@ -314,8 +442,11 @@ fn decode_entry(value: &Value) -> Result<CatalogEntry, Error> {
 /// Verify fetched destination-manifest bytes against the digest the
 /// catalog entry pinned.
 pub fn verify_destination(manifest_bytes: &[u8], pinned_digest: &str) -> Result<(), Error> {
+    // §9 pins oversize destination manifests to
+    // entry_manifest_unavailable (a fetch-bound failure), not
+    // entry_manifest_mismatch (a digest/content conflict).
     if manifest_bytes.len() > MAX_DESTINATION_MANIFEST_BYTES {
-        return Err(Error::EntryManifestMismatch(format!(
+        return Err(Error::EntryManifestUnavailable(format!(
             "destination manifest exceeds {MAX_DESTINATION_MANIFEST_BYTES} bytes"
         )));
     }
@@ -326,4 +457,79 @@ pub fn verify_destination(manifest_bytes: &[u8], pinned_digest: &str) -> Result<
         )));
     }
     Ok(())
+}
+
+/// §3 detached-`.sig` agreement, defined AFTER base64 decoding: the
+/// embedded signature and the `.sig` file contents must decode to the
+/// same 64 signature bytes, regardless of padding differences. A
+/// client that fetches the detached form fails closed on disagreement
+/// (`snapshot_invalid` when `snapshot` is true, else
+/// `provider_manifest_invalid`).
+pub fn verify_detached_sig(
+    signed_document: &[u8],
+    sig_file: &[u8],
+    snapshot: bool,
+) -> Result<(), Error> {
+    let fail = |m: String| {
+        if snapshot {
+            Error::SnapshotInvalid(m)
+        } else {
+            Error::ProviderManifestInvalid(m)
+        }
+    };
+    let value: Value = serde_json::from_slice(signed_document)
+        .map_err(|e| fail(format!("malformed JSON: {e}")))?;
+    let embedded = value
+        .get("signature")
+        .and_then(Value::as_str)
+        .ok_or_else(|| fail("document has no signature field".into()))?;
+    let detached = std::str::from_utf8(sig_file)
+        .map_err(|_| fail("detached .sig is not UTF-8".into()))?
+        .trim_end_matches('\n');
+    let embedded_bytes =
+        keys::decode_signature_b64(embedded).map_err(|e| fail(format!("embedded: {e}")))?;
+    let detached_bytes =
+        keys::decode_signature_b64(detached).map_err(|e| fail(format!("detached: {e}")))?;
+    if embedded_bytes != detached_bytes {
+        return Err(fail(
+            "detached .sig disagrees with embedded signature".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// §4.2: within one provider, entries for the same `componentId`
+/// across its catalogs must carry the same `manifest.digest`; a
+/// mismatch is provider-level equivocation, surfaced as a source
+/// integrity warning. Returns the offending componentIds.
+pub fn cross_catalog_equivocation(snapshots: &[&VerifiedSnapshot]) -> Vec<String> {
+    conflicting_digests(snapshots.iter().map(|s| s.entries.as_slice()))
+}
+
+/// §9 `source_conflict`: two configured sources bind the same
+/// `componentId` to different manifest digests — both claims are
+/// preserved; the conflict is surfaced, never suppressed. Returns the
+/// conflicted componentIds.
+pub fn source_conflicts(a: &[CatalogEntry], b: &[CatalogEntry]) -> Vec<String> {
+    conflicting_digests([a, b])
+}
+
+fn conflicting_digests<'a>(
+    entry_sets: impl IntoIterator<Item = &'a [CatalogEntry]>,
+) -> Vec<String> {
+    let mut bindings: std::collections::BTreeMap<&str, &str> = std::collections::BTreeMap::new();
+    let mut conflicted = std::collections::BTreeSet::new();
+    for entries in entry_sets {
+        for entry in entries {
+            match bindings.get(entry.component_id.as_str()) {
+                Some(digest) if *digest != entry.manifest.digest => {
+                    conflicted.insert(entry.component_id.clone());
+                }
+                _ => {
+                    bindings.insert(&entry.component_id, &entry.manifest.digest);
+                }
+            }
+        }
+    }
+    conflicted.into_iter().collect()
 }
