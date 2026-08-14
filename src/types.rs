@@ -261,10 +261,15 @@ pub fn validate_uri(value: &str) -> Result<(), Error> {
         .map(|i| authority_start + i)
         .unwrap_or(value.len());
     let authority = &value[authority_start..authority_end];
-    // Userinfo is already rejected above; anything after the last `@`
-    // is host[:port].
-    let host_port = authority.rsplit('@').next().unwrap_or(authority);
-    if host_port.contains(':') {
+    // §7: no userinfo — enforced over the RAW authority too, because
+    // an EMPTY userinfo (`https://@host/x`) parses to an empty
+    // username and slips past the parsed-userinfo check above.
+    if authority.contains('@') {
+        return Err(Error::Malformed(format!(
+            "{value}: userinfo component in raw URI string not allowed"
+        )));
+    }
+    if authority.contains(':') {
         return Err(Error::Malformed(format!(
             "{value}: port component in raw URI string not allowed"
         )));

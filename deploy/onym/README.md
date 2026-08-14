@@ -12,6 +12,8 @@ manifest.json                      # signed DiscoveryProviderManifest
 manifest.json.sig
 catalogs/onym-services.json        # signed CatalogSnapshot (sequence chain)
 catalogs/onym-services.json.sig
+catalogs/onym-services-<N>.json    # §5 retention siblings: every published
+catalogs/onym-services-<N>.json.sig  # sequence N stays served until it expires
 manifests/onym-courier.json        # signed courier ServiceManifest (nostr.onym.app)
 manifests/onym-blossom.json        # signed blob ServiceManifest (blossom.onym.app)
 policies/onym-services.md          # inclusion/ranking policy the snapshot pins

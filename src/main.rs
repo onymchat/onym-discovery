@@ -85,6 +85,12 @@ enum VerifyCommand {
         manifest: PathBuf,
         #[arg(long)]
         previous: Option<PathBuf>,
+        /// The catalog's previously declared `policy` digest
+        /// (`sha256:<hex>`), as retained across a manifest update —
+        /// enables the §4.2 one-generation policy-transition grace.
+        /// Requires --previous.
+        #[arg(long, requires = "previous")]
+        previous_policy: Option<String>,
         #[arg(long)]
         at: Option<String>,
     },
@@ -185,7 +191,6 @@ fn main() -> Result<()> {
                 out.with_file_name(format!("{}-{}.json", parsed.catalog_id, built.sequence));
             std::fs::write(&retention, &built.bytes)?;
             std::fs::write(sig_path(&retention), format!("{sig}\n"))?;
-            println!("retention sibling {}", retention.display());
             println!(
                 "wrote {} (sequence {}, {} bytes, digest {})",
                 out.display(),
@@ -193,17 +198,19 @@ fn main() -> Result<()> {
                 built.bytes.len(),
                 built.digest
             );
+            println!("retention sibling {}", retention.display());
         }
         Command::Verify(command) => match command {
             VerifyCommand::Manifest { file, at } => {
                 let raw = std::fs::read(&file).with_context(|| file.display().to_string())?;
                 let verified = verify_manifest(&raw, moment(&at)?)?;
                 println!(
-                    "OK {} — operator {} ({} catalogs, {} skipped)",
+                    "OK {} — operator {} ({} catalogs, {} skipped, {} audience-skipped)",
                     verified.manifest.provider_id,
                     verified.manifest.operator,
                     verified.catalogs.len(),
-                    verified.skipped.len()
+                    verified.skipped.len(),
+                    verified.audience_skipped.len()
                 );
                 println!("digest {}", sha256_digest(&raw));
             }
@@ -211,6 +218,7 @@ fn main() -> Result<()> {
                 file,
                 manifest,
                 previous,
+                previous_policy,
                 at,
             } => {
                 let raw = std::fs::read(&file).with_context(|| file.display().to_string())?;
@@ -222,7 +230,10 @@ fn main() -> Result<()> {
                     .as_ref()
                     .map(|p| -> Result<RetainedCatalogState> {
                         let bytes = std::fs::read(p).with_context(|| p.display().to_string())?;
-                        Ok(RetainedCatalogState::from_snapshot_bytes(&bytes)?)
+                        Ok(RetainedCatalogState::from_snapshot_bytes(
+                            &bytes,
+                            previous_policy.clone(),
+                        )?)
                     })
                     .transpose()?;
                 let verified = verify_snapshot(&raw, &parsed_manifest, retained.as_ref(), now)?;

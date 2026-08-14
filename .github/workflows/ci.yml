@@ -23,3 +23,18 @@ jobs:
           TMP=$(mktemp -d)
           $BIN keygen --out "$TMP/operator.seed"
           $BIN fingerprint --seed "$TMP/operator.seed"
+          # Build a snapshot twice and assert the §5 retention siblings
+          # (<catalogId>-<sequence>.json) are written alongside.
+          OPERATOR=$($BIN fingerprint --seed "$TMP/operator.seed" | awk '/^operator:/ {print $2}')
+          DIGEST="sha256:$(printf '1%.0s' $(seq 64))"
+          printf '{"catalogId":"smoke","providerId":"onym:component:smoke-provider","policyDigest":"%s","expiryDays":30,"entries":[{"componentId":"onym:component:smoke-entry","seatType":"transport.message","manifest":{"uri":"https://example.org/manifest.json","digest":"%s"},"operator":"%s","listedAt":"2026-08-13T00:00:00Z","relationship":"none","placement":"policy-ranked"}]}' \
+            "$DIGEST" "$DIGEST" "$OPERATOR" > "$TMP/config.json"
+          mkdir -p "$TMP/out"
+          $BIN build-snapshot --seed "$TMP/operator.seed" --config "$TMP/config.json" \
+            --out "$TMP/out/smoke.json"
+          test -f "$TMP/out/smoke-1.json"
+          test -f "$TMP/out/smoke-1.json.sig"
+          $BIN build-snapshot --seed "$TMP/operator.seed" --config "$TMP/config.json" \
+            --previous "$TMP/out/smoke-1.json" --out "$TMP/out/smoke.json"
+          test -f "$TMP/out/smoke-2.json"
+          test -f "$TMP/out/smoke-2.json.sig"

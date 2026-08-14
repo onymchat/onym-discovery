@@ -5,7 +5,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use time::OffsetDateTime;
 
-use crate::canonical::signing_bytes;
+use crate::canonical::{reject_duplicate_keys, signing_bytes};
 use crate::error::Error;
 use crate::keys;
 use crate::types::*;
@@ -149,6 +149,11 @@ fn decode_descriptor(value: &Value) -> Result<CatalogDescriptor, Error> {
 /// one-generation transition grace).
 #[derive(Debug, Clone)]
 pub struct RetainedCatalogState {
+    /// The catalog the retained snapshot belongs to — retained state is
+    /// keyed per `(providerId, catalogId)` (§8), so comparing a
+    /// snapshot against state retained for a DIFFERENT catalog is a
+    /// caller error, rejected distinctly (not as a fork).
+    pub catalog_id: String,
     pub sequence: u64,
     pub digest: String,
     pub previous_policy: Option<String>,
@@ -156,14 +161,17 @@ pub struct RetainedCatalogState {
 
 impl RetainedCatalogState {
     /// Derive retained state from the exact bytes of a previously
-    /// accepted snapshot.
-    pub fn from_snapshot_bytes(raw: &[u8]) -> Result<Self, Error> {
+    /// accepted snapshot, plus the catalog's previously declared
+    /// `policy` digest when the client retained one (the §4.2
+    /// one-generation transition grace).
+    pub fn from_snapshot_bytes(raw: &[u8], previous_policy: Option<String>) -> Result<Self, Error> {
         let snapshot: CatalogSnapshot = serde_json::from_slice(raw)
             .map_err(|e| Error::Malformed(format!("previous snapshot: {e}")))?;
         Ok(RetainedCatalogState {
+            catalog_id: snapshot.catalog_id,
             sequence: snapshot.sequence,
             digest: sha256_digest(raw),
-            previous_policy: None,
+            previous_policy,
         })
     }
 }
@@ -241,6 +249,17 @@ pub fn verify_snapshot(
                 snapshot.catalog_id
             ))
         })?;
+    // §8: retained state is per `(providerId, catalogId)` — state
+    // retained for a different catalog must never be compared against
+    // this snapshot's chain (a distinct rejection, not a "fork").
+    if let Some(r) = retained {
+        if r.catalog_id != snapshot.catalog_id {
+            return Err(invalid(format!(
+                "previous snapshot is for a different catalog ({} vs {})",
+                r.catalog_id, snapshot.catalog_id
+            )));
+        }
+    }
     validate_digest(&snapshot.policy_digest).map_err(|e| invalid(e.to_string()))?;
     // §4.2 policy-transition grace: the snapshot's policyDigest must
     // match the manifest's current declaration OR the immediately
@@ -477,6 +496,10 @@ pub fn verify_detached_sig(
             Error::ProviderManifestInvalid(m)
         }
     };
+    // §3: duplicate keys make the document invalid — checked BEFORE
+    // the tree parse, whose last-key-wins decoding would otherwise let
+    // a document with two `signature` fields slip through this path.
+    reject_duplicate_keys(signed_document).map_err(|e| fail(e.to_string()))?;
     let value: Value = serde_json::from_slice(signed_document)
         .map_err(|e| fail(format!("malformed JSON: {e}")))?;
     let embedded = value
@@ -498,12 +521,32 @@ pub fn verify_detached_sig(
     Ok(())
 }
 
+/// Outcome of the §4.2 cross-catalog equivocation check.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CrossCatalogCheck {
+    /// componentIds bound to conflicting digests within one provider.
+    Conflicts(Vec<String>),
+    /// The snapshots do not all share one `providerId` — the check is
+    /// defined WITHIN a provider; disagreement between providers is a
+    /// §9 `source_conflict`, not provider-level equivocation.
+    DifferentProviders,
+}
+
 /// §4.2: within one provider, entries for the same `componentId`
 /// across its catalogs must carry the same `manifest.digest`; a
 /// mismatch is provider-level equivocation, surfaced as a source
-/// integrity warning. Returns the offending componentIds.
-pub fn cross_catalog_equivocation(snapshots: &[&VerifiedSnapshot]) -> Vec<String> {
-    conflicting_digests(snapshots.iter().map(|s| s.entries.as_slice()))
+/// integrity warning. Returns the offending componentIds, or
+/// `DifferentProviders` when the snapshots span providers.
+pub fn cross_catalog_equivocation(snapshots: &[&VerifiedSnapshot]) -> CrossCatalogCheck {
+    let mut providers = snapshots.iter().map(|s| s.snapshot.provider_id.as_str());
+    if let Some(first) = providers.next() {
+        if providers.any(|p| p != first) {
+            return CrossCatalogCheck::DifferentProviders;
+        }
+    }
+    CrossCatalogCheck::Conflicts(conflicting_digests(
+        snapshots.iter().map(|s| s.entries.as_slice()),
+    ))
 }
 
 /// §9 `source_conflict`: two configured sources bind the same

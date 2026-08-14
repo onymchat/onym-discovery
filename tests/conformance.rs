@@ -55,7 +55,7 @@ fn operator() -> String {
 }
 
 fn retained(bytes: &[u8]) -> RetainedCatalogState {
-    RetainedCatalogState::from_snapshot_bytes(bytes).unwrap()
+    RetainedCatalogState::from_snapshot_bytes(bytes, None).unwrap()
 }
 
 fn destination_manifest_bytes() -> Vec<u8> {
@@ -562,6 +562,44 @@ fn policy_transition_grace() {
 }
 
 #[test]
+fn policy_transition_grace_from_fixtures() {
+    // The same §4.2 grace, exercised end-to-end over the byte-pinned
+    // fixture files and the `from_snapshot_bytes` constructor the CLI
+    // uses (previously the constructor could not carry the retained
+    // previous policy, making the grace unreachable from the CLI).
+    let dir = fixtures_dir();
+    let manifest_raw = std::fs::read(dir.join("policy-transition-manifest.json")).unwrap();
+    let s1 = std::fs::read(dir.join("snapshot-1.json")).unwrap();
+    let manifest = verify_manifest(&manifest_raw, VERIFY_AT).unwrap();
+    let state =
+        RetainedCatalogState::from_snapshot_bytes(&s1, Some(format!("sha256:{}", "11".repeat(32))))
+            .unwrap();
+    let v = verify_snapshot(&s1, &manifest, Some(&state), VERIFY_AT).unwrap();
+    assert!(v.policy_transition);
+    // Without the retained previous declaration the grace must NOT
+    // fire: snapshot_invalid.
+    let bare = RetainedCatalogState::from_snapshot_bytes(&s1, None).unwrap();
+    let err = verify_snapshot(&s1, &manifest, Some(&bare), VERIFY_AT).unwrap_err();
+    assert_eq!(err.code(), Some("snapshot_invalid"));
+}
+
+#[test]
+fn previous_snapshot_from_different_catalog_rejected() {
+    // §8: retained state is per (providerId, catalogId); a previous
+    // snapshot from a DIFFERENT catalog is rejected distinctly, not
+    // misreported as a chain fork.
+    let manifest = verify_manifest(&provider_manifest_bytes(), VERIFY_AT).unwrap();
+    let (_, s1, ..) = build_chain();
+    let other = equivocation_snapshot_bytes("catalog-a", "66");
+    let state = RetainedCatalogState::from_snapshot_bytes(&other, None).unwrap();
+    let err = verify_snapshot(&s1, &manifest, Some(&state), VERIFY_AT).unwrap_err();
+    assert_eq!(err.code(), Some("snapshot_invalid"));
+    let message = err.to_string();
+    assert!(message.contains("different catalog"), "{message}");
+    assert!(!message.contains("fork"), "{message}");
+}
+
+#[test]
 fn audience_skip_manifest_is_valid_and_empty() {
     // §1/§10 item 13: a manifest of decodable but non-public catalogs
     // is a valid, empty-by-policy source; the skip count is surfaced.
@@ -569,6 +607,13 @@ fn audience_skip_manifest_is_valid_and_empty() {
     assert!(verified.catalogs.is_empty());
     assert_eq!(verified.audience_skipped, vec![0]);
     assert!(verified.skipped.is_empty());
+    // The same counts, over the byte-pinned fixture file the CLI's
+    // `verify manifest` audience-skipped line reports from.
+    let raw = std::fs::read(fixtures_dir().join("audience-skip-manifest.json")).unwrap();
+    let from_fixture = verify_manifest(&raw, VERIFY_AT).unwrap();
+    assert!(from_fixture.catalogs.is_empty());
+    assert_eq!(from_fixture.audience_skipped, vec![0]);
+    assert!(from_fixture.skipped.is_empty());
 }
 
 #[test]
@@ -676,6 +721,43 @@ fn invalid_status_or_nonempty_evidence_skips_entry() {
 }
 
 #[test]
+fn builder_rejects_bad_status_and_nonempty_evidence() {
+    // The builder must not emit entries a conforming verifier would
+    // skip: an invalid status state or non-empty §4.2 evidence fails
+    // the build outright.
+    let mut tampered_status = json!({
+        "catalogId": "public-all-seats",
+        "providerId": "onym:component:onym-discovery",
+        "policyDigest": format!("sha256:{}", "11".repeat(32)),
+        "expiryDays": 30,
+        "entries": [{
+            "componentId": "onym:component:onym-courier",
+            "seatType": "transport.message",
+            "manifest": {
+                "uri": "https://discovery.onym.app/manifests/onym-courier.json",
+                "digest": format!("sha256:{}", "44".repeat(32)),
+            },
+            "operator": operator(),
+            "listedAt": "2026-08-13T00:00:00Z",
+            "relationship": "none",
+            "placement": "policy-ranked"
+        }]
+    });
+    let mut tampered_evidence = tampered_status.clone();
+    tampered_status["entries"][0]["status"] = json!({"state": "suspended"});
+    tampered_evidence["entries"][0]["evidence"] = json!([{
+        "type": "audit",
+        "uri": "https://x.example/a",
+        "digest": format!("sha256:{}", "11".repeat(32)),
+    }]);
+    for bad in [tampered_status, tampered_evidence] {
+        let config: SnapshotConfig = serde_json::from_value(bad).unwrap();
+        let err = build_snapshot(&config, None, GENERATED_AT, &key(), &fixtures_dir());
+        assert!(err.is_err());
+    }
+}
+
+#[test]
 fn unknown_relationship_skips_entry() {
     // §4.2 fails closed against the extensible relationship set: a
     // disclosure the client cannot render is one the user never saw.
@@ -729,7 +811,24 @@ fn cross_catalog_equivocation_surfaced() {
     .unwrap();
     assert_eq!(
         cross_catalog_equivocation(&[&a, &b]),
-        vec!["onym:component:onym-courier".to_string()]
+        CrossCatalogCheck::Conflicts(vec!["onym:component:onym-courier".to_string()])
+    );
+}
+
+#[test]
+fn cross_catalog_check_requires_one_provider() {
+    // §4.2's equivocation check is defined WITHIN a provider; handing
+    // it snapshots from different providers is a category error,
+    // surfaced distinctly (cross-provider disagreement is the §9
+    // source_conflict path instead).
+    let manifest_a = verify_manifest(&provider_manifest_bytes(), VERIFY_AT).unwrap();
+    let (_, s1, ..) = build_chain();
+    let a = verify_snapshot(&s1, &manifest_a, None, VERIFY_AT).unwrap();
+    let manifest_b = verify_manifest(&conflict_provider_bytes(), VERIFY_AT).unwrap();
+    let b = verify_snapshot(&conflict_snapshot_bytes(), &manifest_b, None, VERIFY_AT).unwrap();
+    assert_eq!(
+        cross_catalog_equivocation(&[&a, &b]),
+        CrossCatalogCheck::DifferentProviders
     );
 }
 
@@ -751,6 +850,19 @@ fn detached_sig_agreement_fails_closed() {
 }
 
 #[test]
+fn detached_sig_rejects_duplicate_signature_keys() {
+    // §3: a document with TWO signature fields must fail closed on the
+    // detached-sig path too — last-key-wins tree decoding must never
+    // pick which one to compare.
+    let doc = br#"{"a": 1, "signature": "AAAA", "signature": "BBBB"}"#;
+    let sig = b"AAAA\n";
+    let err = verify_detached_sig(doc, sig, false).unwrap_err();
+    assert_eq!(err.code(), Some("provider_manifest_invalid"));
+    let err = verify_detached_sig(doc, sig, true).unwrap_err();
+    assert_eq!(err.code(), Some("snapshot_invalid"));
+}
+
+#[test]
 fn uri_rules_enforced() {
     for bad in [
         "http://discovery.onym.app/catalog.json",
@@ -759,6 +871,9 @@ fn uri_rules_enforced() {
         "https://192.168.1.1/catalog.json",
         "https://[::1]/catalog.json",
         "https://user@discovery.onym.app/catalog.json",
+        // §7: EMPTY userinfo parses to an empty username, so the raw
+        // authority must reject any `@` outright.
+        "https://@discovery.onym.app/catalog.json",
         "https://discovery.onym.app:8443/catalog.json",
         // §7: the RAW string must not carry a port component — URL
         // libraries normalize a redundant `:443` away before any
@@ -849,6 +964,10 @@ fn canonical_escaping_vector() {
     assert!(text.contains(r#""slash":"a/b""#), "{text}");
     assert!(text.contains(r#""twochar":"\b\f\n\r\t""#), "{text}");
     assert!(text.contains("\"unicode\":\"héllo → 日本\""), "{text}");
+    // Full-byte equality against the byte-pinned fixture: the class
+    // spot-checks above cannot catch an extra or reordered byte.
+    let fixture = std::fs::read(fixtures_dir().join("canonical-escaping-bytes.bin")).unwrap();
+    assert_eq!(canonical, fixture);
 }
 
 #[test]
