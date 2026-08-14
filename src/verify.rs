@@ -67,6 +67,26 @@ pub fn verify_manifest(raw: &[u8], now: OffsetDateTime) -> Result<VerifiedManife
     let operator_key =
         parse_operator_key(&manifest.operator).map_err(|e| invalid(e.to_string()))?;
 
+    // Self-signature BEFORE descriptor decoding, audience skips, and
+    // the duplicate-catalogId fatal: those all diagnose the OPERATOR's
+    // declarations, so forged or tampered manifest bytes must
+    // diagnose as a signature failure, not as (say) "duplicate
+    // catalogId" — a content accusation the operator never signed.
+    let signature = manifest
+        .signature
+        .as_deref()
+        .ok_or_else(|| invalid("manifest is unsigned".into()))?;
+    let bytes = signing_bytes(raw).map_err(|e| invalid(e.to_string()))?;
+    keys::verify(&operator_key, &bytes, signature).map_err(|e| invalid(e.to_string()))?;
+
+    let valid_until = parse_timestamp(&manifest.valid_until).map_err(|e| invalid(e.to_string()))?;
+    if valid_until <= now {
+        return Err(invalid(format!(
+            "manifest expired at {}",
+            manifest.valid_until
+        )));
+    }
+
     // Lossy per-descriptor decode (§4.1): a descriptor with unknown
     // keys or otherwise malformed is skipped and counted, never
     // document-fatal; zero surviving descriptors is fatal.
@@ -103,21 +123,6 @@ pub fn verify_manifest(raw: &[u8], now: OffsetDateTime) -> Result<VerifiedManife
     }
     validate_uri(&manifest.privacy_profile_uri).map_err(|e| invalid(e.to_string()))?;
     validate_digest(&manifest.privacy_profile).map_err(|e| invalid(e.to_string()))?;
-
-    let valid_until = parse_timestamp(&manifest.valid_until).map_err(|e| invalid(e.to_string()))?;
-    if valid_until <= now {
-        return Err(invalid(format!(
-            "manifest expired at {}",
-            manifest.valid_until
-        )));
-    }
-
-    let signature = manifest
-        .signature
-        .as_deref()
-        .ok_or_else(|| invalid("manifest is unsigned".into()))?;
-    let bytes = signing_bytes(raw).map_err(|e| invalid(e.to_string()))?;
-    keys::verify(&operator_key, &bytes, signature).map_err(|e| invalid(e.to_string()))?;
 
     Ok(VerifiedManifest {
         manifest,
@@ -302,6 +307,52 @@ pub fn verify_snapshot(
             snapshot.provider_id, manifest.manifest.provider_id
         )));
     }
+    // Signature FIRST (after the pure schema checks above), over the
+    // exact fetched bytes' canonical form, by the manifest's operator
+    // key: §6's fork/rollback rejections are provider-attributed
+    // equivocation accusations, and the freshness checks are claims
+    // about what the provider published — none of them may be
+    // reachable for bytes that do not carry the operator's signature,
+    // or any unauthenticated party serving forged bytes at the
+    // snapshot URL could make the client accuse the provider of
+    // forking.
+    let operator_key =
+        parse_operator_key(&manifest.manifest.operator).map_err(|e| invalid(e.to_string()))?;
+    let signature = snapshot
+        .signature
+        .as_deref()
+        .ok_or_else(|| invalid("snapshot is unsigned".into()))?;
+    let bytes = signing_bytes(raw).map_err(|e| invalid(e.to_string()))?;
+    keys::verify(&operator_key, &bytes, signature).map_err(|e| invalid(e.to_string()))?;
+
+    // Freshness (operator-signed bytes from here on).
+    let generated_at =
+        parse_timestamp(&snapshot.generated_at).map_err(|e| invalid(e.to_string()))?;
+    let expires_at = parse_timestamp(&snapshot.expires_at).map_err(|e| invalid(e.to_string()))?;
+    if expires_at <= generated_at {
+        return Err(invalid("expiresAt must be after generatedAt".into()));
+    }
+    if expires_at - generated_at > MAX_EXPIRY_WINDOW {
+        return Err(invalid("expiry window exceeds 90 days".into()));
+    }
+    // A future-dated generatedAt would let a provider mint freshness
+    // past the 90-day ceiling; allow only small clock skew.
+    if generated_at > now + CLOCK_SKEW {
+        return Err(invalid(format!(
+            "generatedAt {} is in the future",
+            snapshot.generated_at
+        )));
+    }
+    // Symmetric skew (§4.2/§9): expired only when expiresAt is more
+    // than the skew allowance in the past — a fast clock must not
+    // reject a fresh snapshot.
+    if expires_at + CLOCK_SKEW < now {
+        return Err(Error::SnapshotExpired(format!(
+            "expired at {}",
+            snapshot.expires_at
+        )));
+    }
+
     let descriptor = manifest
         .catalogs
         .iter()
@@ -415,52 +466,26 @@ pub fn verify_snapshot(
             } else {
                 // Forward jump: accepted with a source-integrity note.
                 // The §6 intermediate continuity walk is fetch-side
-                // and not performed by this offline verifier.
+                // and not performed by this offline verifier — but a
+                // jump that CLAIMS to directly succeed the retained
+                // sequence (previousDigest equal to the retained
+                // digest while sequence > retained + 1) is
+                // self-inconsistent on its face and needs no walk to
+                // reject.
+                if snapshot.previous_digest.as_deref() == Some(r.digest.as_str()) {
+                    return Err(invalid(format!(
+                        "forward jump to sequence {} carries previousDigest of retained \
+                         sequence {} — a snapshot cannot both directly succeed it and \
+                         skip past it",
+                        snapshot.sequence, r.sequence
+                    )));
+                }
                 ChainOutcome::ForwardJumpWithNote {
                     missed: snapshot.sequence - r.sequence - 1,
                 }
             }
         }
     };
-
-    // Freshness.
-    let generated_at =
-        parse_timestamp(&snapshot.generated_at).map_err(|e| invalid(e.to_string()))?;
-    let expires_at = parse_timestamp(&snapshot.expires_at).map_err(|e| invalid(e.to_string()))?;
-    if expires_at <= generated_at {
-        return Err(invalid("expiresAt must be after generatedAt".into()));
-    }
-    if expires_at - generated_at > MAX_EXPIRY_WINDOW {
-        return Err(invalid("expiry window exceeds 90 days".into()));
-    }
-    // A future-dated generatedAt would let a provider mint freshness
-    // past the 90-day ceiling; allow only small clock skew.
-    if generated_at > now + CLOCK_SKEW {
-        return Err(invalid(format!(
-            "generatedAt {} is in the future",
-            snapshot.generated_at
-        )));
-    }
-    // Symmetric skew (§4.2/§9): expired only when expiresAt is more
-    // than the skew allowance in the past — a fast clock must not
-    // reject a fresh snapshot.
-    if expires_at + CLOCK_SKEW < now {
-        return Err(Error::SnapshotExpired(format!(
-            "expired at {}",
-            snapshot.expires_at
-        )));
-    }
-
-    // Signature over the exact fetched bytes' canonical form, by the
-    // manifest's operator key.
-    let operator_key =
-        parse_operator_key(&manifest.manifest.operator).map_err(|e| invalid(e.to_string()))?;
-    let signature = snapshot
-        .signature
-        .as_deref()
-        .ok_or_else(|| invalid("snapshot is unsigned".into()))?;
-    let bytes = signing_bytes(raw).map_err(|e| invalid(e.to_string()))?;
-    keys::verify(&operator_key, &bytes, signature).map_err(|e| invalid(e.to_string()))?;
 
     // Entries: lossy decode, then strict per-entry field validation;
     // duplicates among surviving entries are fatal.
@@ -518,8 +543,11 @@ fn decode_entry(value: &Value) -> Result<CatalogEntry, Error> {
             entry.relationship
         )));
     }
-    if entry.placement.is_empty() {
-        return Err(Error::Malformed("empty placement".into()));
+    if !PLACEMENTS.contains(&entry.placement.as_str()) {
+        return Err(Error::Malformed(format!(
+            "unknown placement {}",
+            entry.placement
+        )));
     }
     // §4.2: evidence must be absent or empty in v1 — a non-empty
     // evidence array skips the entry (unrenderable attestation).
@@ -654,6 +682,12 @@ pub fn source_conflicts(a: &[CatalogEntry], b: &[CatalogEntry]) -> Vec<String> {
     conflicting_digests([a, b])
 }
 
+/// Conflict DETECTION, not enumeration: returns each componentId that
+/// is bound to more than one distinct digest, once. The map keeps the
+/// FIRST digest seen per componentId, so with three or more differing
+/// bindings the individual digest pairs are not enumerated — callers
+/// get "which componentIds conflict" and surface both underlying
+/// entries themselves (they hold the entry sets).
 fn conflicting_digests<'a>(
     entry_sets: impl IntoIterator<Item = &'a [CatalogEntry]>,
 ) -> Vec<String> {

@@ -503,6 +503,88 @@ fn forward_jump_accepted_with_note() {
 }
 
 #[test]
+fn self_inconsistent_forward_jump_rejected() {
+    // A forward jump may skip intermediates (the continuity walk is
+    // fetch-side), but it cannot CLAIM to directly succeed the
+    // retained snapshot while jumping past it: previousDigest equal to
+    // the retained digest with sequence > retained + 1 is
+    // self-inconsistent on its face and rejected without any walk.
+    let manifest = verify_manifest(&provider_manifest_bytes(), VERIFY_AT).unwrap();
+    let (_, s1, _, s3) = build_chain();
+    // The legitimate jump (previousDigest naming the unseen
+    // intermediate) stays accepted-with-note.
+    let legit = verify_snapshot(&s3, &manifest, Some(&retained(&s1)), VERIFY_AT).unwrap();
+    assert_eq!(
+        legit.outcome,
+        ChainOutcome::ForwardJumpWithNote { missed: 1 }
+    );
+    let mut doc: Value = serde_json::from_slice(&s3).unwrap();
+    doc.as_object_mut().unwrap().remove("signature");
+    doc["previousDigest"] = json!(sha256_digest(&s1));
+    let inconsistent = sign_document(&serde_json::to_vec(&doc).unwrap(), &key()).unwrap();
+    let err =
+        verify_snapshot(&inconsistent, &manifest, Some(&retained(&s1)), VERIFY_AT).unwrap_err();
+    assert_eq!(err.code(), Some("snapshot_invalid"));
+    assert!(
+        err.to_string().contains("cannot both directly succeed"),
+        "{err}"
+    );
+}
+
+#[test]
+fn forged_bytes_at_retained_sequence_diagnose_as_signature_failure() {
+    // §6 fork/rollback are provider-attributed equivocation
+    // accusations, reachable only for operator-signed bytes: unsigned
+    // or tampered bytes served at the retained sequence must fail on
+    // the SIGNATURE — never as a "fork" the provider gets blamed for
+    // on the strength of bytes anyone could have forged.
+    let manifest = verify_manifest(&provider_manifest_bytes(), VERIFY_AT).unwrap();
+    let (_, _, s2, _) = build_chain();
+    // Tampered: content changed, embedded signature left as-is.
+    let mut doc: Value = serde_json::from_slice(&s2).unwrap();
+    doc["expiresAt"] = json!("2026-09-13T00:00:00Z");
+    let tampered = serde_json::to_vec(&doc).unwrap();
+    let err = verify_snapshot(&tampered, &manifest, Some(&retained(&s2)), VERIFY_AT).unwrap_err();
+    assert_eq!(err.code(), Some("snapshot_invalid"));
+    let message = err.to_string();
+    assert!(
+        message.contains("signature verification failed"),
+        "{message}"
+    );
+    assert!(!message.contains("fork"), "{message}");
+    // Unsigned entirely: same rule.
+    let mut doc: Value = serde_json::from_slice(&s2).unwrap();
+    doc.as_object_mut().unwrap().remove("signature");
+    doc["expiresAt"] = json!("2026-09-13T00:00:00Z");
+    let unsigned = serde_json::to_vec(&doc).unwrap();
+    let err = verify_snapshot(&unsigned, &manifest, Some(&retained(&s2)), VERIFY_AT).unwrap_err();
+    assert_eq!(err.code(), Some("snapshot_invalid"));
+    let message = err.to_string();
+    assert!(message.contains("unsigned"), "{message}");
+    assert!(!message.contains("fork"), "{message}");
+}
+
+#[test]
+fn forged_manifest_diagnoses_as_signature_failure() {
+    // Same ordering in verify_manifest: descriptor decoding, audience
+    // skips, and the duplicate-catalogId fatal all diagnose the
+    // OPERATOR's declarations, so they run only over self-signed
+    // bytes. A tampered manifest carrying a duplicate catalogId fails
+    // on the signature, not with a content accusation.
+    let mut doc: Value = serde_json::from_slice(&provider_manifest_bytes()).unwrap();
+    let dup = doc["catalogs"][0].clone();
+    doc["catalogs"].as_array_mut().unwrap().push(dup);
+    let err = verify_manifest(&serde_json::to_vec(&doc).unwrap(), VERIFY_AT).unwrap_err();
+    assert_eq!(err.code(), Some("provider_manifest_invalid"));
+    let message = err.to_string();
+    assert!(
+        message.contains("signature verification failed"),
+        "{message}"
+    );
+    assert!(!message.contains("duplicate catalogId"), "{message}");
+}
+
+#[test]
 fn no_op_refresh_is_not_a_warning() {
     // §6/§10 item 11: identical latest snapshot re-fetched — the
     // provider simply hasn't published since; no warning.
@@ -897,6 +979,28 @@ fn unknown_relationship_skips_entry() {
     let verified = verify_snapshot(&signed, &manifest, None, VERIFY_AT).unwrap();
     assert!(verified.entries.is_empty());
     assert_eq!(verified.skipped, vec![0]);
+}
+
+#[test]
+fn unknown_placement_skips_entry() {
+    // placement is pinned like relationship (§4.2 fails closed): an
+    // unknown value is a commercial disclosure the client cannot
+    // render, so the entry is skipped — and the builder refuses to
+    // emit one a conforming verifier would skip.
+    let (destination, s1, ..) = build_chain();
+    let manifest = verify_manifest(&provider_manifest_bytes(), VERIFY_AT).unwrap();
+    let mut doc: Value = serde_json::from_slice(&s1).unwrap();
+    doc.as_object_mut().unwrap().remove("signature");
+    doc["entries"][0]["placement"] = json!("organic-looking");
+    let signed = sign_document(&serde_json::to_vec(&doc).unwrap(), &key()).unwrap();
+    let verified = verify_snapshot(&signed, &manifest, None, VERIFY_AT).unwrap();
+    assert!(verified.entries.is_empty());
+    assert_eq!(verified.skipped, vec![0]);
+    // Builder side.
+    let mut config = snapshot_config(&sha256_digest(&destination));
+    config.entries[0]["placement"] = json!("organic-looking");
+    let err = build_snapshot(&config, None, GENERATED_AT, &key(), &fixtures_dir()).unwrap_err();
+    assert!(err.to_string().contains("unknown placement"), "{err}");
 }
 
 #[test]

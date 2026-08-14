@@ -68,12 +68,38 @@ fetch() {  # fetch to a temp file, move into place only on success —
     && mv "out/catalogs/$1.tmp" "out/catalogs/$1" \
     || { rm -f "out/catalogs/$1.tmp"; return 1; }
 }
+served_sequence() {  # sequence of the currently served latest; 0 when
+                     # nothing is served yet (first publish)
+  seq=$(curl -fsS "$base/onym-services.json" \
+    | grep -o '"sequence":[0-9]*' | head -1 | cut -d: -f2)
+  echo "${seq:-0}"
+}
+backfill_by_sequence() {
+  # walk N down from the currently served sequence until the first 404
+  # (older siblings past that have expired and been removed); starts AT
+  # the served sequence — its own sibling is published too and must be
+  # preserved like the rest
+  current=$(served_sequence)
+  n=$current
+  while [ "${n:-0}" -ge 1 ]; do
+    fetch "onym-services-$n.json" || break
+    fetch "onym-services-$n.json.sig" \
+      || { echo "FATAL: sibling $n served without its .sig" >&2; exit 1; }
+    n=$((n - 1))
+  done
+}
 if listing=$(curl -fsS "$base/"); then
   siblings=$(printf '%s\n' "$listing" \
     | grep -o 'onym-services-[0-9]*\.json\(\.sig\)\?' | sort -u)
-  # a served index that lists no siblings is only correct before the
-  # first publish — on any later publish treat it as a failed listing,
-  # never as "nothing to preserve"
+  if [ -z "$siblings" ] && [ "$(served_sequence)" -ge 1 ]; then
+    # a served index that lists no siblings is only correct before the
+    # first publish — while any snapshot is being served, treat it as a
+    # FAILED listing, never as "nothing to preserve", and fall back to
+    # the explicit sequence walk
+    echo "WARNING: $base/ lists no siblings while a snapshot is served" >&2
+    echo "treating as a failed listing; backfilling by sequence range" >&2
+    backfill_by_sequence
+  fi
   for f in $siblings; do
     [ -e "out/catalogs/$f" ] || fetch "$f" \
       || { echo "FATAL: could not fetch published sibling $f" >&2; exit 1; }
@@ -81,18 +107,7 @@ if listing=$(curl -fsS "$base/"); then
 else
   echo "WARNING: cannot enumerate $base/ (no directory listing?)" >&2
   echo "backfilling by explicit sequence range instead" >&2
-  # walk N down from the currently served sequence until the first 404
-  # (older siblings past that have expired and been removed)
-  current=$(curl -fsS "$base/onym-services.json" \
-    | grep -o '"sequence":[0-9]*' | head -1 | cut -d: -f2)
-  [ -n "$current" ] || current=0   # nothing served yet: first publish
-  n=$((current - 1))
-  while [ "$n" -ge 1 ]; do
-    fetch "onym-services-$n.json" || break
-    fetch "onym-services-$n.json.sig" \
-      || { echo "FATAL: sibling $n served without its .sig" >&2; exit 1; }
-    n=$((n - 1))
-  done
+  backfill_by_sequence
 fi
 
 # 4. build the snapshot (chain onto the previously PUBLISHED bytes;

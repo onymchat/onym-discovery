@@ -130,6 +130,14 @@ pub const RELATIONSHIPS: &[&str] = &[
     "other-disclosed",
 ];
 
+/// Accepted `placement` values, pinned like [`RELATIONSHIPS`] and
+/// failing closed the same way (§4.2: an undecodable `placement` skips
+/// the entry — a commercial disclosure the client cannot render is a
+/// disclosure the user never saw). The values are the ones the
+/// abstract contract's §5.3 example and this profile's fixtures use;
+/// admitting a new one is a profile version bump, not a soft addition.
+pub const PLACEMENTS: &[&str] = &["policy-ranked", "sponsored"];
+
 /// `onym:key:<64 lowercase hex>` → 32 raw public-key bytes.
 pub fn parse_operator_key(value: &str) -> Result<[u8; 32], Error> {
     let hex_part = value.strip_prefix("onym:key:").ok_or_else(|| {

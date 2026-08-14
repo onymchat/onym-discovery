@@ -137,6 +137,12 @@ fn resolve_entry(raw_entry: &Value, config_dir: &std::path::Path) -> Result<Valu
             decoded.relationship
         )));
     }
+    if !PLACEMENTS.contains(&decoded.placement.as_str()) {
+        return Err(Error::Malformed(format!(
+            "unknown placement {}",
+            decoded.placement
+        )));
+    }
     // §4.2: evidence must be absent or empty in v1; status, when
     // present, must be a renderable warning/review state. A builder
     // must not emit entries a conforming verifier would skip.
