@@ -1,0 +1,126 @@
+name: Deploy
+
+# Publishes the signed Onym Discovery provider (deploy/onym) to
+# https://discovery.onym.app/ — a static directory on the SAME
+# DigitalOcean droplet the rest of the onym.app stack runs on
+# (onym-infra: Caddy + strfry + blossom + relayer + moderation).
+# Manual trigger only, and it asks for confirmation: a publish extends a
+# signed, append-only sequence chain that cannot be un-published.
+#
+# Steps: build the release CLI -> sign manifests + build the snapshot
+# chained onto the previously PUBLISHED bytes (first deploy = genesis)
+# -> verify everything exactly as a client would -> rsync to
+# /var/www/discovery (never deleting: retention siblings stay live) ->
+# idempotently ensure the Caddy vhost -> upsert the grey-cloud
+# Cloudflare A record and purge the cache.
+#
+# Required SECRETS (names match onym-infra's deploy workflow):
+#   DO_API_KEY               DigitalOcean API token        (org-level)
+#   CF_API_TOKEN             Cloudflare token, DNS edit on onym.app
+#                            (org-level; cache purge additionally wants
+#                            Zone.Cache Purge — purge is non-fatal
+#                            without it)
+#   SSH_PRIVATE_KEY          Private key the onym-infra droplet trusts
+#                            (same key onym-infra deploys with)
+#
+# Signing SECRETS (do NOT exist yet — generate and add them, or run with
+# skip_signing=true and commit locally signed artifacts to
+# deploy/onym/out/ instead; see deploy/onym/README.md for the tradeoff):
+#   DISCOVERY_OPERATOR_SEED  64 hex chars — signs the provider manifest
+#                            and the catalog snapshot
+#   COURIER_OPERATOR_SEED    64 hex chars — signs manifests/onym-courier
+#   BLOSSOM_OPERATOR_SEED    64 hex chars — signs manifests/onym-blossom
+#
+# Repository VARIABLES (optional — defaults shown):
+#   DISCOVERY_HOST   discovery.onym.app
+#   DOMAIN           onym.app
+#   DROPLET_NAME     onym-infra    (adopted by name, as onym-infra does)
+#   DROPLET_ID       unset         (set it to pin the exact box; printed
+#                                   in the job summary)
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: 'Type "deploy" to confirm publishing to discovery.onym.app'
+        required: true
+        type: string
+      skip_signing:
+        description: 'Deploy the pre-signed artifacts committed under deploy/onym/out/ instead of signing in CI'
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+# Two publishes racing would both chain onto the same previous snapshot
+# and fork the sequence; serialize them.
+concurrency:
+  group: deploy-discovery
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require confirmation
+        env:
+          CONFIRM: ${{ inputs.confirm }}
+        run: |
+          if [ "$CONFIRM" != "deploy" ]; then
+            echo 'Refusing: type "deploy" in the confirm input to publish.' >&2
+            exit 1
+          fi
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build release CLI
+        run: cargo build --release --locked
+
+      - name: Install doctl
+        uses: digitalocean/action-doctl@v2
+        with:
+          token: ${{ secrets.DO_API_KEY }}
+
+      - name: Install dig + rsync
+        run: sudo apt-get update && sudo apt-get install -y dnsutils rsync
+
+      - name: Write SSH key
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+        run: |
+          if [ -z "$SSH_PRIVATE_KEY" ]; then
+            echo 'SSH_PRIVATE_KEY is not set. It must be the key the onym-infra' >&2
+            echo 'droplet trusts (the same secret onym-infra deploys with).' >&2
+            exit 1
+          fi
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$SSH_PRIVATE_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          ssh-keygen -y -f ~/.ssh/deploy_key > ~/.ssh/deploy_key.pub
+
+      - name: Sign, build snapshot, verify, assemble
+        env:
+          SKIP_SIGNING: ${{ inputs.skip_signing }}
+          DISCOVERY_HOST: ${{ vars.DISCOVERY_HOST || 'discovery.onym.app' }}
+          SERVE_DIR: ${{ runner.temp }}/serve
+          DISCOVERY_OPERATOR_SEED: ${{ secrets.DISCOVERY_OPERATOR_SEED }}
+          COURIER_OPERATOR_SEED: ${{ secrets.COURIER_OPERATOR_SEED }}
+          BLOSSOM_OPERATOR_SEED: ${{ secrets.BLOSSOM_OPERATOR_SEED }}
+        run: ./deploy/onym/ci-assemble.sh
+
+      - name: Deploy to droplet, ensure Caddy vhost, DNS + purge
+        env:
+          DO_API_KEY: ${{ secrets.DO_API_KEY }}
+          CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
+          DISCOVERY_HOST: ${{ vars.DISCOVERY_HOST || 'discovery.onym.app' }}
+          DOMAIN: ${{ vars.DOMAIN || 'onym.app' }}
+          DROPLET_NAME: ${{ vars.DROPLET_NAME || 'onym-infra' }}
+          DROPLET_ID: ${{ vars.DROPLET_ID }}
+          SERVE_DIR: ${{ runner.temp }}/serve
+        run: SSH_KEY_PATH="$HOME/.ssh/deploy_key" ./deploy/onym/ci-deploy.sh

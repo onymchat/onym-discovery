@@ -39,7 +39,60 @@ printed `onym:key:<hex>`. Distinct seats may use distinct keys; the
 courier/blossom manifests are signed by *their* operator's key (today
 the same organization, still separate seed files by policy).
 
-## Each publish
+## Publishing from CI (the default path)
+
+`.github/workflows/deploy.yml` runs the publish from a manual
+`workflow_dispatch` (type `deploy` in the confirm input). It builds the
+release CLI, signs, chains the snapshot onto the previously *published*
+bytes (first run = genesis), verifies everything exactly as a client
+would, rsyncs to `/var/www/discovery` on the onym-infra droplet
+(resolved with `doctl` by `DROPLET_ID` variable or the `onym-infra`
+name, same as onym-infra's own deploy), idempotently installs the Caddy
+vhost, and upserts the grey-cloud Cloudflare A record.
+
+Secrets it needs, matching onym-infra's names where they already exist:
+
+| Secret | Status |
+|---|---|
+| `DO_API_KEY` | org-level, exists |
+| `CF_API_TOKEN` | org-level, exists |
+| `SSH_PRIVATE_KEY` | the key the droplet trusts — same secret onym-infra deploys with |
+| `DISCOVERY_OPERATOR_SEED` | **you must generate and add** (64 hex chars) |
+| `COURIER_OPERATOR_SEED` | **you must generate and add** (64 hex chars) |
+| `BLOSSOM_OPERATOR_SEED` | **you must generate and add** (64 hex chars) |
+
+Generate each seed with `onym-discovery keygen --out <name>.seed`; the
+secret value is the file's single 64-hex-char line. Publish the printed
+fingerprints out of band. The seed files themselves stay out of this
+repository (`.gitignore` covers `*.seed`).
+
+**CI-held keys are a real tradeoff.** Putting the seeds in Actions
+secrets means GitHub (and anyone who can edit this repository's
+workflows) is inside your signing perimeter: a malicious workflow change
+could exfiltrate a seed or sign something you never reviewed. In
+exchange, publishing is one click and the seeds never sit on a laptop.
+If you prefer the keys never to leave your machine, run the workflow
+with `skip_signing: true`: it then deploys the pre-signed artifacts
+committed under `out/` (produced by the manual runbook below), and CI is
+reduced to verify + transport — it holds no signing material at all.
+Either way the verify gate runs before a byte leaves the runner.
+
+CI hard-fails, with the reason, when: a `REPLACE-*` placeholder is still
+unfilled; `policies/onym-services.md`, `privacy.md`, or the `reviewed/`
+manifests are missing; a pinned digest does not match the bytes being
+served; a seed secret is unset (and `skip_signing` is not); or the live
+snapshot cannot be fetched for a reason other than "does not exist yet"
+— it refuses to guess rather than fork the sequence chain.
+
+Note for after PR #3 lands (retention siblings + `--sig` verify flags):
+`build-snapshot` will start writing `onym-services-<sequence>.json`
+retention siblings itself, and the verify gate in `ci-assemble.sh`
+should grow `--sig <file>.sig` on both `verify` calls so the detached
+signatures are checked for agreement too. Until then CI preserves any
+already-published siblings by fetching them and by never rsyncing with
+`--delete`.
+
+## Each publish (manual runbook — the alternative)
 
 ```sh
 # 1. sign the seat manifests hosted here (only when their content changed)
@@ -145,7 +198,9 @@ onym-discovery verify snapshot out/catalogs/onym-services.json \
 # 7. upload out/ to the static host, byte-for-byte — and NEVER with a
 #    mirror/delete flag (rsync --delete, aws s3 sync --delete): out/
 #    now contains every unexpired retention sibling, but a mirroring
-#    upload from a fresh or partial out/ would still drop history
+#    upload from a fresh or partial out/ would still drop history.
+#    Alternatively, use the CI path: run the deploy workflow with
+#    skip_signing: true and pre-signed artifacts (see below).
 ```
 
 Rules that are easy to violate and must not be:
