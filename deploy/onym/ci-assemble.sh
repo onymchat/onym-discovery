@@ -22,6 +22,10 @@
 #   SERVE_DIR        where to assemble the served tree (default deploy/onym/serve)
 #   DISCOVERY_HOST   public hostname (default discovery.onym.app)
 #   SKIP_SIGNING     "true" to use committed deploy/onym/out/ artifacts
+#   GENESIS          "true" only for the very first publish (sequence 1);
+#                    any build that would start a new chain aborts without it
+#   CF_API_TOKEN     optional; lets the genesis guard cross-check Cloudflare
+#   DOMAIN           Cloudflare zone for that cross-check (default onym.app)
 #   *_OPERATOR_SEED  signing seeds (only when SKIP_SIGNING != true)
 set -euo pipefail
 
@@ -31,8 +35,13 @@ SRC="$SCRIPT_DIR"
 OUT="$SRC/out"
 SERVE_DIR="${SERVE_DIR:-$SRC/serve}"
 WORK="${WORK_DIR:-$(mktemp -d)}"
+# The work dir holds the fetched previous snapshot AND (briefly) the
+# signing seeds; make sure it dies with the script, on success or abort.
+trap 'rm -rf "$WORK"' EXIT
 DISCOVERY_HOST="${DISCOVERY_HOST:-discovery.onym.app}"
 SKIP_SIGNING="${SKIP_SIGNING:-false}"
+GENESIS="${GENESIS:-false}"
+DOMAIN="${DOMAIN:-onym.app}"
 BIN="$REPO_ROOT/target/release/onym-discovery"
 CONFIG="$SRC/catalogs/onym-services.config.json"
 POLICY="$SRC/policies/onym-services.md"
@@ -46,7 +55,7 @@ for c in curl python3; do
     command -v "$c" >/dev/null || die "missing required command: $c"
 done
 
-# ─── Source sanity (before the slow CLI build — fail fast) ────────────
+# ─── Source sanity (fail fast, before anything is signed) ─────────────
 #
 # Fail on the runner, with a reason, before anything is signed: the
 # templates ship with REPLACE-* placeholders that must be filled once
@@ -126,10 +135,34 @@ fi
 #
 # The snapshot must chain onto the previously PUBLISHED bytes. Only two
 # outcomes may proceed: the live snapshot was fetched (chain onto it),
-# or it demonstrably does not exist — the hostname does not resolve, or
-# the site answers 404 — which is the genesis publish. Every other
-# failure aborts: quietly building a genesis snapshot over an already
-# published chain would fork the sequence.
+# or the operator explicitly declared this the genesis publish
+# (GENESIS=true) and nothing contradicts that. A failed fetch is NEVER
+# taken as evidence that nothing is published — DNS can fail for a host
+# that served a chain yesterday (resolver outage, deleted record,
+# runner egress) — and quietly building a genesis snapshot over an
+# already published chain would fork the sequence. No path guesses.
+
+# cf_a_record_exists — cross-check Cloudflare when DNS resolution fails:
+# an existing A record for the host means a deploy has already run, so
+# the DNS failure is an outage, not "nothing published yet".
+# Returns 0 if the record exists, 1 if it provably does not,
+# 2 if the check itself could not be performed.
+cf_a_record_exists() {
+    [ -n "${CF_API_TOKEN:-}" ] || return 2
+    local cf="https://api.cloudflare.com/client/v4" zone_id count
+    zone_id="$(curl -fsS --connect-timeout 15 "$cf/zones?name=$DOMAIN" \
+        -H "Authorization: Bearer $CF_API_TOKEN" 2>/dev/null \
+        | python3 -c "import sys,json; r=json.load(sys.stdin)['result']; print(r[0]['id'] if r else '')")" \
+        || return 2
+    [ -n "$zone_id" ] || return 2
+    count="$(curl -fsS --connect-timeout 15 \
+        "$cf/zones/$zone_id/dns_records?type=A&name=$DISCOVERY_HOST" \
+        -H "Authorization: Bearer $CF_API_TOKEN" 2>/dev/null \
+        | python3 -c "import sys,json; print(len(json.load(sys.stdin)['result']))")" \
+        || return 2
+    [ "$count" -gt 0 ] && return 0
+    return 1
+}
 
 PREV="$WORK/previous.json"
 PREV_ARGS=()
@@ -140,17 +173,58 @@ status="$(curl -sS --connect-timeout 15 -o "$PREV" -w '%{http_code}' "$SNAPSHOT_
 rc=$?
 set -e
 if [ "$rc" -eq 6 ]; then
-    info "  $DISCOVERY_HOST does not resolve — genesis publish (sequence 1)"
+    # DNS resolution failed. That is NOT proof nothing is published:
+    # cross-check the Cloudflare zone before even considering genesis.
+    set +e
+    cf_a_record_exists
+    cf_rc=$?
+    set -e
+    if [ "$cf_rc" -eq 0 ]; then
+        die "$DISCOVERY_HOST did not resolve, but Cloudflare still holds an A
+  record for it — a deploy has already run and the resolution failure is an
+  outage (resolver, runner egress, or a mid-flight zone change), not a fresh
+  host. Building genesis now would fork the published sequence chain.
+  Retry when $SNAPSHOT_URL is reachable."
+    fi
+    if [ "$GENESIS" != "true" ]; then
+        die "$DISCOVERY_HOST did not resolve and this run was not declared the
+  genesis publish. A DNS failure is not evidence that nothing is published,
+  and building genesis over an existing chain would fork the sequence.
+  If this truly is the FIRST publish (sequence 1), re-run the workflow with
+  genesis=true. Otherwise retry when $SNAPSHOT_URL resolves."
+    fi
+    if [ "$cf_rc" -eq 1 ]; then
+        info "  $DISCOVERY_HOST does not resolve and has no Cloudflare A record; genesis=true — genesis publish (sequence 1)"
+    else
+        info "  $DISCOVERY_HOST does not resolve (Cloudflare cross-check unavailable); genesis=true — genesis publish (sequence 1)"
+    fi
 elif [ "$rc" -ne 0 ]; then
     cat "$WORK/curl.err" >&2 || true
     die "could not fetch the previous snapshot (curl exit $rc). Refusing to
   guess: if a snapshot is already published, building genesis would fork the
   sequence chain. Retry when $SNAPSHOT_URL is reachable."
 elif [ "$status" = "404" ]; then
-    info "  no snapshot published yet (HTTP 404) — genesis publish (sequence 1)"
+    if [ "$GENESIS" != "true" ]; then
+        die "$SNAPSHOT_URL answers HTTP 404 but this run was not declared the
+  genesis publish. If this truly is the FIRST publish (sequence 1), re-run
+  the workflow with genesis=true. If a snapshot has ever been published,
+  investigate the 404 before deploying — genesis would fork the chain."
+    fi
+    info "  no snapshot published yet (HTTP 404); genesis=true — genesis publish (sequence 1)"
 elif [ "$status" = "200" ]; then
+    if [ "$GENESIS" = "true" ]; then
+        die "genesis=true, but $SNAPSHOT_URL is live — a chain is already
+  published. Re-run without genesis to chain onto it."
+    fi
     PREV_ARGS=(--previous "$PREV")
     info "  chaining onto sequence $(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["sequence"])' "$PREV")"
+    # Keep the exact previous bytes (and detached signature) for the §5
+    # retention sibling written below — the previousDigest chain pins
+    # these bytes, so they must come from THIS fetch, not a later one.
+    if ! curl -fsS --connect-timeout 15 -o "$PREV.sig" "$SNAPSHOT_URL.sig"; then
+        rm -f "$PREV.sig"
+        err "warning: could not fetch $SNAPSHOT_URL.sig — the previous snapshot's retention sibling will be published without its detached signature"
+    fi
 else
     die "unexpected HTTP $status fetching the previous snapshot; refusing to guess. Retry, or investigate $SNAPSHOT_URL."
 fi
@@ -162,22 +236,45 @@ mkdir -p "$SERVE_DIR/catalogs" "$SERVE_DIR/manifests" "$SERVE_DIR/policies"
 
 # §5 retention siblings (`onym-services-<sequence>.json`): once PR #3's
 # tooling lands, build-snapshot writes them itself. Snapshots published
-# before that carry none, so also fetch whatever siblings the live site
-# already serves — and ci-deploy.sh rsyncs without --delete, so droplet-
-# side history survives either way. Best-effort: a missing sibling is a
-# 404, not a failure.
+# before that carry none, so:
+#
+#   1. The snapshot we just chained onto becomes its own sibling, from
+#      the EXACT bytes fetched above — the new snapshot's previousDigest
+#      pins those bytes, so re-fetching (or losing) them would break the
+#      chain a client walks. This guarantees every publish preserves its
+#      predecessor even before PR #3's CLI-written siblings land.
+#   2. Best-effort backfill of older siblings the live site already
+#      serves (a missing one is a 404, not a failure) — bounded to the
+#      newest SIBLING_BACKFILL_MAX sequences so it cannot grow into an
+#      unbounded serial curl walk, fetched in parallel with short
+#      timeouts. ci-deploy.sh rsyncs without --delete, so droplet-side
+#      history older than the bound survives regardless.
+SIBLING_BACKFILL_MAX="${SIBLING_BACKFILL_MAX:-100}"
 if [ "${#PREV_ARGS[@]}" -gt 0 ]; then
     prev_seq="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["sequence"])' "$PREV")"
-    i=1
+
+    cp "$PREV" "$SERVE_DIR/catalogs/onym-services-$prev_seq.json"
+    [ ! -f "$PREV.sig" ] || cp "$PREV.sig" "$SERVE_DIR/catalogs/onym-services-$prev_seq.json.sig"
+
+    first_seq=$(( prev_seq > SIBLING_BACKFILL_MAX ? prev_seq - SIBLING_BACKFILL_MAX + 1 : 1 ))
+    i="$first_seq"
+    in_flight=0
     while [ "$i" -le "$prev_seq" ]; do
         for name in "onym-services-$i.json" "onym-services-$i.json.sig"; do
             dst="$SERVE_DIR/catalogs/$name"
-            if ! curl -fsS --connect-timeout 15 -o "$dst" "https://$DISCOVERY_HOST/catalogs/$name"; then
-                rm -f "$dst"
+            [ -f "$dst" ] && continue   # never overwrite the exact bytes kept above
+            { curl -fsS --connect-timeout 5 --max-time 20 \
+                -o "$dst" "https://$DISCOVERY_HOST/catalogs/$name" \
+                || rm -f "$dst"; } &
+            in_flight=$((in_flight + 1))
+            if [ "$in_flight" -ge 16 ]; then
+                wait
+                in_flight=0
             fi
         done
         i=$((i + 1))
     done
+    wait
 fi
 
 # ─── Sign (or adopt the pre-signed out/) ──────────────────────────────
@@ -198,7 +295,9 @@ if [ "$SKIP_SIGNING" != "true" ]; then
   this repository or the org. Alternatively re-run this workflow with
   skip_signing=true to deploy pre-signed artifacts committed under
   deploy/onym/out/ — see deploy/onym/README.md for the tradeoff."
-        printf '%s' "$value" | grep -qE '^[0-9a-fA-F]{64}$' \
+        # [[ =~ ]] anchors over the WHOLE value — grep matches per line,
+        # so "junk\n<64 hex>\n" would sneak past a piped grep.
+        [[ "$value" =~ ^[0-9a-fA-F]{64}$ ]] \
             || die "$name must be exactly 64 hex chars (a raw Ed25519 seed)"
         (umask 077 && printf '%s\n' "$value" > "$path")
     }

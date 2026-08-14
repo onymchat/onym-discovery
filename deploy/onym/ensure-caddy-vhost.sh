@@ -37,8 +37,16 @@ die()  { err "$@"; exit 1; }
 mkdir -p "$WEB_ROOT" "$SNIPPET_DIR"
 
 # If onym-infra grows a native vhost for the discovery host, it owns the
-# routing (and the mounts) and this stopgap must not fight it.
-if grep -qE "DISCOVERY_HOST|^[[:space:]]*${HOST}[[:space:]]*\{" "$CADDYFILE"; then
+# routing (and the mounts) and this stopgap must not fight it. Only an
+# actual site block counts: a site-address line opening a `{` block for
+# the literal host (dots escaped — sub.onym.app must not match
+# subXonym.app) or for the {$DISCOVERY_HOST} placeholder, optionally
+# with a scheme/port or further comma-separated addresses. A comment or
+# an unrelated mention of the hostname must NOT make this script exit 0
+# while no vhost exists.
+HOST_RE="$(printf '%s' "$HOST" | sed 's/\./\\./g')"
+SITE_ADDR_RE="^[[:space:]]*(https?://)?(\{\\\$DISCOVERY_HOST\}|${HOST_RE})(:[0-9]+)?[[:space:]]*(,[^{}]*)?\{[[:space:]]*$"
+if grep -qE "$SITE_ADDR_RE" "$CADDYFILE"; then
     info "Caddyfile already carries a native $HOST vhost — nothing to do"
     exit 0
 fi

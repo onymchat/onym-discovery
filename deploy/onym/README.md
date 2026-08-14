@@ -29,22 +29,82 @@ have no natural HTTPS document root of their own.
 
 ## One-time setup
 
+Everything below is a hard requirement: `ci-assemble.sh` fails fast,
+with the reason, when any of it is missing. This list is where those
+fail-fast messages point.
+
+**1. Generate the signing keys.**
+
 ```sh
 onym-discovery keygen --out ~/secrets/onym-discovery-operator.seed
 # note the printed fingerprint: publish it out of band (site, repo, release notes)
 ```
 
-Fill every `REPLACE-OPERATOR-KEY` in the `*.src.json` templates with the
-printed `onym:key:<hex>`. Distinct seats may use distinct keys; the
-courier/blossom manifests are signed by *their* operator's key (today
-the same organization, still separate seed files by policy).
+Distinct seats may use distinct keys; the courier/blossom manifests are
+signed by *their* operator's key (today the same organization, still
+separate seed files by policy).
+
+**2. Author the served documents.** Write the two Markdown documents
+this directory serves — they do not exist until you write them:
+
+- `policies/onym-services.md` — the inclusion/ranking policy the
+  snapshot pins;
+- `privacy.md` — the provider privacy profile.
+
+**3. Compute and fill both digests.** The templates pin the exact bytes
+of those documents; compute the digests from the final files:
+
+```sh
+shasum -a 256 policies/onym-services.md
+shasum -a 256 privacy.md
+```
+
+Prefix each hex digest with `sha256:` and fill:
+
+- `REPLACE-POLICY-DIGEST` (policy digest) — in
+  `catalogs/onym-services.config.json` (`policyDigest`) and
+  `provider-manifest.src.json` (the catalog's `policy`);
+- `REPLACE-PRIVACY-DIGEST` (privacy digest) — in
+  `provider-manifest.src.json` (`privacyProfile`).
+
+Editing either document later means recomputing its digest, or the
+digest check aborts the build.
+
+**4. Fill the operator keys.** Each `onym:key:REPLACE-*` placeholder
+takes the `onym:key:<hex>` a `keygen` run printed:
+
+- `REPLACE-OPERATOR-KEY` in `provider-manifest.src.json` — the
+  discovery operator key;
+- the four per-seat keys in `catalogs/onym-services.config.json`:
+  `REPLACE-AUTHORITY-KEY`, `REPLACE-RELAYER-KEY`,
+  `REPLACE-COURIER-KEY`, `REPLACE-BLOSSOM-KEY` — each entry's key must
+  be the one its manifest is actually signed with;
+- `REPLACE-COURIER-KEY` again in `manifests/onym-courier.src.json` and
+  `REPLACE-BLOSSOM-KEY` in `manifests/onym-blossom.src.json`.
+
+**5. Fetch and review the external manifests.** The relayer and
+authority host their own manifests; you pin the bytes you reviewed:
+
+```sh
+curl -fsS https://relayer.onym.app/manifest.json    > reviewed/onym-relayer.json
+curl -fsS https://moderation.onym.app/manifest.json > reviewed/onym-authority.json
+# read them; the digest you pin is the review you performed
+```
+
+**6. Create the `production` GitHub environment.** The deploy job runs
+in `environment: production`; create it in the repository settings and
+add required reviewers, so a dispatch — or any workflow change that
+reaches for the seed secrets — needs a human approval before the
+environment's secrets are released.
 
 ## Publishing from CI (the default path)
 
 `.github/workflows/deploy.yml` runs the publish from a manual
-`workflow_dispatch` (type `deploy` in the confirm input). It builds the
-release CLI, signs, chains the snapshot onto the previously *published*
-bytes (first run = genesis), verifies everything exactly as a client
+`workflow_dispatch` (type `deploy` in the confirm input; for the very
+first publish also set `genesis: true` — without it, a run that cannot
+fetch the live snapshot aborts rather than start a new chain). It
+builds the release CLI, signs, chains the snapshot onto the previously
+*published* bytes, verifies everything exactly as a client
 would, rsyncs to `/var/www/discovery` on the onym-infra droplet
 (resolved with `doctl` by `DROPLET_ID` variable or the `onym-infra`
 name, same as onym-infra's own deploy), idempotently installs the Caddy
@@ -81,8 +141,12 @@ CI hard-fails, with the reason, when: a `REPLACE-*` placeholder is still
 unfilled; `policies/onym-services.md`, `privacy.md`, or the `reviewed/`
 manifests are missing; a pinned digest does not match the bytes being
 served; a seed secret is unset (and `skip_signing` is not); or the live
-snapshot cannot be fetched for a reason other than "does not exist yet"
-— it refuses to guess rather than fork the sequence chain.
+snapshot cannot be fetched — for any reason, including DNS failure —
+without `genesis: true`. A fetch failure is never read as "nothing
+published yet": starting a new chain takes the explicit genesis input,
+and even then a Cloudflare A record already existing for the host
+aborts the run. It refuses to guess rather than fork the sequence
+chain.
 
 Note for after PR #3 lands (retention siblings + `--sig` verify flags):
 `build-snapshot` will start writing `onym-services-<sequence>.json`

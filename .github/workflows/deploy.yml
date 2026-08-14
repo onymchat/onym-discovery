@@ -8,8 +8,10 @@ name: Deploy
 # signed, append-only sequence chain that cannot be un-published.
 #
 # Steps: build the release CLI -> sign manifests + build the snapshot
-# chained onto the previously PUBLISHED bytes (first deploy = genesis)
-# -> verify everything exactly as a client would -> rsync to
+# chained onto the previously PUBLISHED bytes (the FIRST deploy must be
+# explicitly declared with the genesis input — a fetch failure is never
+# taken to mean "nothing published") -> verify everything exactly as a
+# client would -> rsync to
 # /var/www/discovery (never deleting: retention siblings stay live) ->
 # idempotently ensure the Caddy vhost -> upsert the grey-cloud
 # Cloudflare A record and purge the cache.
@@ -50,6 +52,11 @@ on:
         required: false
         default: false
         type: boolean
+      genesis:
+        description: 'FIRST publish only: declare this the genesis build (sequence 1). Without it, any run that cannot fetch the live snapshot aborts rather than start a new chain.'
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: read
@@ -63,6 +70,11 @@ concurrency:
 jobs:
   deploy:
     runs-on: ubuntu-latest
+    # Gate the signing seeds behind the "production" environment — create
+    # it in repo Settings with required reviewers so a dispatch (and any
+    # workflow edit that reaches for the seed secrets) needs a human
+    # approval first. See deploy/onym/README.md "One-time setup".
+    environment: production
     steps:
       - name: Require confirmation
         env:
@@ -107,7 +119,12 @@ jobs:
       - name: Sign, build snapshot, verify, assemble
         env:
           SKIP_SIGNING: ${{ inputs.skip_signing }}
+          GENESIS: ${{ inputs.genesis }}
           DISCOVERY_HOST: ${{ vars.DISCOVERY_HOST || 'discovery.onym.app' }}
+          DOMAIN: ${{ vars.DOMAIN || 'onym.app' }}
+          # Lets the genesis guard cross-check the Cloudflare A record
+          # when DNS resolution fails.
+          CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
           SERVE_DIR: ${{ runner.temp }}/serve
           DISCOVERY_OPERATOR_SEED: ${{ secrets.DISCOVERY_OPERATOR_SEED }}
           COURIER_OPERATOR_SEED: ${{ secrets.COURIER_OPERATOR_SEED }}
