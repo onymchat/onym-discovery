@@ -67,7 +67,7 @@ pub fn build_snapshot(
     let expires_at = generated_at + time::Duration::days(i64::from(config.expiry_days));
     let mut document = json!({
         "version": 1,
-        "implementationProfile": IMPLEMENTATION_PROFILE,
+        "implementationProfileId": IMPLEMENTATION_PROFILE,
         "catalogId": config.catalog_id,
         "providerId": config.provider_id,
         "sequence": sequence,

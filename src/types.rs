@@ -24,7 +24,7 @@ pub const MAX_EXPIRY_WINDOW: time::Duration = time::Duration::days(90);
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct ProviderManifest {
     pub version: u32,
-    pub implementation_profile: String,
+    pub implementation_profile_id: String,
     pub provider_id: String,
     pub operator: String,
     pub seat: String,
@@ -56,7 +56,7 @@ pub struct CatalogDescriptor {
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct CatalogSnapshot {
     pub version: u32,
-    pub implementation_profile: String,
+    pub implementation_profile_id: String,
     pub catalog_id: String,
     pub provider_id: String,
     pub sequence: u64,

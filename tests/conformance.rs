@@ -63,7 +63,7 @@ fn destination_manifest_bytes() -> Vec<u8> {
 fn provider_manifest_bytes() -> Vec<u8> {
     let unsigned = serde_json::to_vec(&json!({
         "version": 1,
-        "implementationProfile": IMPLEMENTATION_PROFILE,
+        "implementationProfileId": IMPLEMENTATION_PROFILE,
         "providerId": "onym:component:onym-discovery",
         "operator": operator(),
         "seat": "discovery",
@@ -332,4 +332,15 @@ fn error_matches_expected_variant() {
         Some("entry_manifest_mismatch")
     );
     assert_eq!(Error::Malformed(String::new()).code(), None);
+}
+
+#[test]
+fn future_dated_snapshot_rejected() {
+    let manifest = verify_manifest(&provider_manifest_bytes(), VERIFY_AT).unwrap();
+    let (_, s1, ..) = build_chain();
+    // Verify at an instant well before generatedAt (2026-08-13): the
+    // snapshot is future-dated from that clock's perspective.
+    let early = datetime!(2026-08-01 00:00:00 UTC);
+    let err = verify_snapshot(&s1, &manifest, None, early).unwrap_err();
+    assert_eq!(err.code(), Some("snapshot_invalid"));
 }

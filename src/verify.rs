@@ -29,10 +29,10 @@ pub fn verify_manifest(raw: &[u8], now: OffsetDateTime) -> Result<ProviderManife
     if manifest.version != 1 {
         return Err(invalid(format!("unsupported version {}", manifest.version)));
     }
-    if manifest.implementation_profile != IMPLEMENTATION_PROFILE {
+    if manifest.implementation_profile_id != IMPLEMENTATION_PROFILE {
         return Err(invalid(format!(
             "unsupported implementation profile {}",
-            manifest.implementation_profile
+            manifest.implementation_profile_id
         )));
     }
     if manifest.seat != "discovery" {
@@ -117,7 +117,7 @@ pub fn verify_snapshot(
     if snapshot.version != 1 {
         return Err(invalid(format!("unsupported version {}", snapshot.version)));
     }
-    if snapshot.implementation_profile != IMPLEMENTATION_PROFILE {
+    if snapshot.implementation_profile_id != IMPLEMENTATION_PROFILE {
         return Err(invalid("unsupported implementation profile".into()));
     }
     if snapshot.provider_id != manifest.provider_id {
@@ -189,6 +189,14 @@ pub fn verify_snapshot(
     }
     if expires_at - generated_at > MAX_EXPIRY_WINDOW {
         return Err(invalid("expiry window exceeds 90 days".into()));
+    }
+    // A future-dated generatedAt would let a provider mint freshness
+    // past the 90-day ceiling; allow only small clock skew.
+    if generated_at > now + time::Duration::minutes(10) {
+        return Err(invalid(format!(
+            "generatedAt {} is in the future",
+            snapshot.generated_at
+        )));
     }
     if expires_at <= now {
         return Err(Error::SnapshotExpired(format!(
