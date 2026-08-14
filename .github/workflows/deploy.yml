@@ -1,0 +1,175 @@
+name: Deploy
+
+# Publishes the signed Onym Discovery provider (deploy/onym) to
+# https://discovery.onym.app/ — a static directory on the SAME
+# DigitalOcean droplet the rest of the onym.app stack runs on
+# (onym-infra: Caddy + strfry + blossom + relayer + moderation).
+# Manual trigger only, and it asks for confirmation: a publish extends a
+# signed, append-only sequence chain that cannot be un-published.
+#
+# Steps: build the release CLI -> sign manifests + build the snapshot
+# chained onto the previously PUBLISHED bytes (the FIRST deploy must be
+# explicitly declared with the genesis input — a fetch failure is never
+# taken to mean "nothing published") -> verify everything exactly as a
+# client would -> rsync to
+# /var/www/discovery (never deleting: retention siblings stay live) ->
+# idempotently ensure the Caddy vhost -> upsert the grey-cloud
+# Cloudflare A record and purge the cache.
+#
+# Required SECRETS (names match onym-infra's deploy workflow):
+#   DO_API_KEY               DigitalOcean API token        (org-level)
+#   CF_API_TOKEN             Cloudflare token, DNS edit on onym.app
+#                            (org-level; cache purge additionally wants
+#                            Zone.Cache Purge — purge is non-fatal
+#                            without it)
+#   SSH_PRIVATE_KEY          Private key the onym-infra droplet trusts
+#                            (same key onym-infra deploys with)
+#
+# Signing SECRETS (do NOT exist yet — generate and add them, or run with
+# skip_signing=true and commit locally signed artifacts to
+# deploy/onym/signed/ instead; see deploy/onym/README.md for the tradeoff):
+#   DISCOVERY_OPERATOR_SEED  64 hex chars — signs the provider manifest
+#                            and the catalog snapshot
+#   COURIER_OPERATOR_SEED    64 hex chars — signs manifests/onym-courier
+#   BLOSSOM_OPERATOR_SEED    64 hex chars — signs manifests/onym-blossom
+#
+# Repository VARIABLES (optional — defaults shown):
+#   DISCOVERY_HOST   discovery.onym.app
+#   DOMAIN           onym.app
+#   DROPLET_NAME     onym-infra    (adopted by name, as onym-infra does)
+#   DROPLET_ID       unset         (set it to pin the exact box; printed
+#                                   in the job summary)
+#   DROPLET_HOST_FINGERPRINT
+#                    unset         (RECOMMENDED: the droplet's SSH host
+#                                   key fingerprint, "SHA256:..." from
+#                                   `ssh-keygen -lf <(ssh-keyscan <ip>)`;
+#                                   when set, ci-deploy.sh dies if the
+#                                   deploy-time scan mismatches. Unset
+#                                   degrades to trust-on-first-scan with
+#                                   a logged warning)
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: 'Type "deploy" to confirm publishing to discovery.onym.app'
+        required: true
+        type: string
+      skip_signing:
+        description: 'Deploy the pre-signed artifacts committed under deploy/onym/signed/ instead of signing in CI'
+        required: false
+        default: false
+        type: boolean
+      genesis:
+        description: 'FIRST publish only: declare this the genesis build (sequence 1). Without it every fetch failure aborts. With it, the Cloudflare zone is cross-checked on every failure path; a wedged first deploy (record points at our droplet, nothing fetchable) recovers with a loud warning.'
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+# Two publishes racing would both chain onto the same previous snapshot
+# and fork the sequence; serialize them.
+concurrency:
+  group: deploy-discovery
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    # Gate the signing seeds behind the "production" environment.
+    # CAUTION: GitHub AUTO-CREATES this environment, UNPROTECTED, on the
+    # first dispatch — merely naming it here provides no approval gate.
+    # The gate exists only after an operator adds required reviewers to
+    # the environment in repo Settings, which must happen BEFORE the
+    # first dispatch. See deploy/onym/README.md "One-time setup", step 1.
+    environment: production
+    steps:
+      - name: Require confirmation
+        env:
+          CONFIRM: ${{ inputs.confirm }}
+        run: |
+          if [ "$CONFIRM" != "deploy" ]; then
+            echo 'Refusing: type "deploy" in the confirm input to publish.' >&2
+            exit 1
+          fi
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build release CLI
+        run: cargo build --release --locked
+
+      - name: Install doctl
+        uses: digitalocean/action-doctl@v2
+        with:
+          token: ${{ secrets.DO_API_KEY }}
+
+      - name: Install dig + rsync
+        run: sudo apt-get update && sudo apt-get install -y dnsutils rsync
+
+      # ci-deploy.sh re-resolves the droplet itself; this early resolve
+      # only feeds DROPLET_IP to ci-assemble.sh, whose genesis RECOVERY
+      # path must prove a dangling A record points at OUR droplet.
+      # Non-fatal: without it that recovery path is simply unavailable
+      # (every ambiguous genesis failure aborts, as before).
+      - name: Resolve droplet IP (for the genesis recovery cross-check)
+        env:
+          DROPLET_NAME: ${{ vars.DROPLET_NAME || 'onym-infra' }}
+          DROPLET_ID: ${{ vars.DROPLET_ID }}
+        run: |
+          id="$DROPLET_ID"
+          if [ -z "$id" ] || ! doctl compute droplet get "$id" >/dev/null 2>&1; then
+            id="$(doctl compute droplet list "$DROPLET_NAME" --format ID --no-header 2>/dev/null | head -1)"
+          fi
+          ip=""
+          if [ -n "$id" ]; then
+            ip="$(doctl compute droplet get "$id" --format PublicIPv4 --no-header 2>/dev/null || true)"
+          fi
+          echo "DROPLET_IP=$ip" >> "$GITHUB_ENV"
+
+      - name: Write SSH key
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+        run: |
+          if [ -z "$SSH_PRIVATE_KEY" ]; then
+            echo 'SSH_PRIVATE_KEY is not set. It must be the key the onym-infra' >&2
+            echo 'droplet trusts (the same secret onym-infra deploys with).' >&2
+            exit 1
+          fi
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$SSH_PRIVATE_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          ssh-keygen -y -f ~/.ssh/deploy_key > ~/.ssh/deploy_key.pub
+
+      - name: Sign, build snapshot, verify, assemble
+        env:
+          SKIP_SIGNING: ${{ inputs.skip_signing }}
+          GENESIS: ${{ inputs.genesis }}
+          DISCOVERY_HOST: ${{ vars.DISCOVERY_HOST || 'discovery.onym.app' }}
+          DOMAIN: ${{ vars.DOMAIN || 'onym.app' }}
+          # Lets the genesis guard cross-check the Cloudflare A record
+          # on every fetch-failure path (DROPLET_IP arrives via
+          # GITHUB_ENV from the resolve step above).
+          CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
+          SERVE_DIR: ${{ runner.temp }}/serve
+          DISCOVERY_OPERATOR_SEED: ${{ secrets.DISCOVERY_OPERATOR_SEED }}
+          COURIER_OPERATOR_SEED: ${{ secrets.COURIER_OPERATOR_SEED }}
+          BLOSSOM_OPERATOR_SEED: ${{ secrets.BLOSSOM_OPERATOR_SEED }}
+        run: ./deploy/onym/ci-assemble.sh
+
+      - name: Deploy to droplet, ensure Caddy vhost, DNS + purge
+        env:
+          DO_API_KEY: ${{ secrets.DO_API_KEY }}
+          CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
+          DISCOVERY_HOST: ${{ vars.DISCOVERY_HOST || 'discovery.onym.app' }}
+          DOMAIN: ${{ vars.DOMAIN || 'onym.app' }}
+          DROPLET_NAME: ${{ vars.DROPLET_NAME || 'onym-infra' }}
+          DROPLET_ID: ${{ vars.DROPLET_ID }}
+          DROPLET_HOST_FINGERPRINT: ${{ vars.DROPLET_HOST_FINGERPRINT }}
+          SERVE_DIR: ${{ runner.temp }}/serve
+        run: SSH_KEY_PATH="$HOME/.ssh/deploy_key" ./deploy/onym/ci-deploy.sh
