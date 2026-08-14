@@ -65,31 +65,53 @@ done
 
 # ─── Source sanity (fail fast, before anything is signed) ─────────────
 #
-# Fail on the runner, with a reason, before anything is signed: the
-# templates ship with REPLACE-* placeholders that must be filled once
-# (operator keys, policy/privacy digests), and the manifest pins the
-# exact bytes of documents that must therefore exist to be served.
+# Fail on the runner, with a reason, before anything is signed. Two
+# kinds of inputs, gated differently by mode:
+#
+#   - SIGNING inputs — the src templates (no REPLACE-* placeholders may
+#     remain) and reviewed/*.json, the externally hosted manifests
+#     fetched and REVIEWED locally (COMMITTED on purpose: the digest the
+#     config pins must correspond to reviewable bytes — the committed
+#     copy is the audit record of that review). Only checked when this
+#     run signs; a skip_signing deploy reads none of them, it serves the
+#     pre-signed signed/ tree (whose completeness is checked below).
+#   - SERVED documents — policies/onym-services.md and privacy.md are
+#     copied into SERVE_DIR in BOTH modes, so they must exist (and, when
+#     signing, hash to the digests the templates pin) in both.
 
-placeholders="$(grep -rlF 'REPLACE-' \
-    "$SRC/provider-manifest.src.json" "$SRC/catalogs" "$SRC/manifests" 2>/dev/null || true)"
-[ -z "$placeholders" ] || die "unfilled REPLACE-* placeholders remain (fill the operator keys and digests per deploy/onym/README.md 'One-time setup'):
+if [ "$SKIP_SIGNING" != "true" ]; then
+    placeholders="$(grep -rlF 'REPLACE-' \
+        "$SRC/provider-manifest.src.json" "$SRC/catalogs" "$SRC/manifests" 2>/dev/null || true)"
+    [ -z "$placeholders" ] || die "unfilled REPLACE-* placeholders remain (fill the operator keys and digests per deploy/onym/README.md 'One-time setup'):
 $placeholders"
 
+    missing=""
+    for f in "$SRC/reviewed/onym-relayer.json" "$SRC/reviewed/onym-authority.json"; do
+        [ -f "$f" ] || missing="$missing  $f
+"
+    done
+    [ -z "$missing" ] || die "required signing inputs are missing:
+$missing  reviewed/*.json are the externally hosted manifests you fetched and
+  REVIEWED (the digest you pin is the review you performed); they are
+  committed on purpose. See deploy/onym/README.md."
+fi
+
 missing=""
-for f in "$POLICY" "$PRIVACY" "$SRC/reviewed/onym-relayer.json" "$SRC/reviewed/onym-authority.json"; do
+for f in "$POLICY" "$PRIVACY"; do
     [ -f "$f" ] || missing="$missing  $f
 "
 done
 [ -z "$missing" ] || die "required source files are missing:
-$missing  policies/onym-services.md and privacy.md are served and digest-pinned
-  by the manifest; reviewed/*.json are the externally hosted manifests you
-  fetched and REVIEWED (the digest you pin is the review you performed).
-  See deploy/onym/README.md."
+$missing  policies/onym-services.md and privacy.md are served (in both modes)
+  and digest-pinned by the manifest. See deploy/onym/README.md."
 
 # The manifest pins sha256 digests of the policy and privacy documents.
 # A drifted digest would sign a promise about bytes that are not the
 # bytes being served, so check before signing rather than after a client
-# rejects them.
+# rejects them. In skip_signing mode the src templates are not what gets
+# served — the digest check against the SIGNED manifest happens after
+# the signed/ completeness gate below.
+if [ "$SKIP_SIGNING" != "true" ]; then
 python3 - "$CONFIG" "$SRC/provider-manifest.src.json" "$POLICY" "$PRIVACY" <<'PY'
 import hashlib, json, sys
 
@@ -133,6 +155,7 @@ if problems:
         print("  - " + problem, file=sys.stderr)
     sys.exit(1)
 PY
+fi
 
 if [ ! -x "$BIN" ]; then
     info "building release CLI..."
@@ -295,7 +318,16 @@ elif [ "$status" = "404" ]; then
     records="$(cf_a_records)"
     cf_rc=$?
     set -e
-    if [ "$cf_rc" -eq 0 ] && [ -n "$DROPLET_IP" ]; then
+    if [ "$cf_rc" -eq 0 ]; then
+        # An A record exists, so the 404 came from a live host — this
+        # run must prove that host is its own droplet. No DROPLET_IP
+        # means no way to prove it: die, exactly as the recovery path
+        # does when the same input is missing.
+        [ -n "$DROPLET_IP" ] || die "genesis=true and $SNAPSHOT_URL answers 404, and a Cloudflare A
+  record exists for $DISCOVERY_HOST — but DROPLET_IP is not set, so this
+  run cannot prove the record points at this deploy's own droplet. The 404
+  may have come from a host this deploy does not control. Aborting; set
+  DROPLET_IP (CI resolves it via doctl) to enable the cross-check."
         bad="$(printf '%s\n' "$records" | grep -vxF "$DROPLET_IP" || true)"
         [ -z "$bad" ] || die "genesis=true and $SNAPSHOT_URL answers 404, but a Cloudflare A
   record for $DISCOVERY_HOST points at $bad — not this deploy's droplet
@@ -329,15 +361,16 @@ fi
 rm -rf "$SERVE_DIR"
 mkdir -p "$SERVE_DIR/catalogs" "$SERVE_DIR/manifests" "$SERVE_DIR/policies"
 
-# §5 retention siblings (`onym-services-<sequence>.json`): once PR #3's
-# tooling lands, build-snapshot writes them itself. Snapshots published
-# before that carry none, so:
+# §5 retention siblings (`onym-services-<sequence>.json`): build-snapshot
+# writes the NEW sequence's sibling itself. Snapshots published by older
+# tooling may carry none, so:
 #
 #   1. The snapshot we just chained onto becomes its own sibling, from
 #      the EXACT bytes fetched above — the new snapshot's previousDigest
 #      pins those bytes, so re-fetching (or losing) them would break the
 #      chain a client walks. This guarantees every publish preserves its
-#      predecessor even before PR #3's CLI-written siblings land.
+#      predecessor even when the predecessor was published by tooling
+#      that wrote no sibling of its own.
 #   2. Best-effort backfill of older siblings the live site already
 #      serves (a missing one is a 404, not a failure) — bounded to the
 #      newest SIBLING_BACKFILL_MAX sequences so it cannot grow into an
@@ -445,6 +478,14 @@ with open(resolved_path, "w") as handle:
 PY
 
     info "building snapshot..."
+    # build-snapshot also writes the §5 retention sibling
+    # (onym-services-<sequence>.json) with a fork guard that refuses to
+    # overwrite a same-named sibling with different bytes. In CI that
+    # guard has nothing to bite on — $OUT was just recreated, so no
+    # prior bytes exist to compare against; here the chain safety comes
+    # from --previous pinning the fetched LIVE snapshot instead. (The
+    # guard earns its keep in the local runbook, where signed/ persists
+    # across runs.)
     "$BIN" build-snapshot --seed "$SEEDS/discovery.seed" \
         --config "$CI_CONFIG" \
         ${PREV_ARGS[@]+"${PREV_ARGS[@]}"} \
@@ -470,25 +511,66 @@ else
   artifacts under deploy/onym/signed/, or re-run without skip_signing to
   sign in CI."
     done
+
+    # The SIGNED manifest pins the policy/privacy digests actually
+    # promised to clients; the served .md bytes must hash to them (the
+    # src-template digest check above is signing-mode only).
+    python3 - "$OUT/manifest.json" "$POLICY" "$PRIVACY" <<'PY'
+import hashlib, json, sys
+
+manifest_path, policy_path, privacy_path = sys.argv[1:4]
+
+def digest(path):
+    with open(path, "rb") as handle:
+        return "sha256:" + hashlib.sha256(handle.read()).hexdigest()
+
+problems = []
+policy_digest = digest(policy_path)
+privacy_digest = digest(privacy_path)
+
+with open(manifest_path) as handle:
+    manifest = json.load(handle)
+for catalog in manifest.get("catalogs", []):
+    if catalog.get("policy") != policy_digest:
+        problems.append(
+            f"{manifest_path}: catalog {catalog.get('catalogId')} pins policy "
+            f"{catalog.get('policy')} but {policy_path} hashes to {policy_digest}"
+        )
+if manifest.get("privacyProfile") != privacy_digest:
+    problems.append(
+        f"{manifest_path}: privacyProfile is {manifest.get('privacyProfile')} "
+        f"but {privacy_path} hashes to {privacy_digest}"
+    )
+
+if problems:
+    print("digest mismatches (the SIGNED manifest pins the exact bytes being served):",
+          file=sys.stderr)
+    for problem in problems:
+        print("  - " + problem, file=sys.stderr)
+    sys.exit(1)
+PY
 fi
 
 # ─── Verify gate — exactly as a client would ──────────────────────────
 #
-# Nothing reaches the droplet unverified. After PR #3 lands, add
-# `--sig <file>.sig` to both commands so the detached signatures are
-# checked for agreement with the embedded ones too.
+# Nothing reaches the droplet unverified — the bytes AND both detached
+# .sig files (`--sig` fails closed on any disagreement with the embedded
+# signature). Checking the .sig matters MOST in skip_signing mode, where
+# the committed signed/*.sig files would otherwise ship unchecked.
 
-info "verifying manifest..."
-"$BIN" verify manifest "$OUT/manifest.json"
-info "verifying snapshot (chain + entries)..."
+info "verifying manifest (embedded + detached signature)..."
+"$BIN" verify manifest "$OUT/manifest.json" \
+    --sig "$OUT/manifest.json.sig"
+info "verifying snapshot (chain + entries + detached signature)..."
 "$BIN" verify snapshot "$OUT/catalogs/onym-services.json" \
     --manifest "$OUT/manifest.json" \
+    --sig "$OUT/catalogs/onym-services.json.sig" \
     ${PREV_ARGS[@]+"${PREV_ARGS[@]}"}
 
 # ─── Final layout (see README: "Layout served at ...") ────────────────
 
 cp "$OUT/manifest.json" "$OUT/manifest.json.sig" "$SERVE_DIR/"
-# Includes any retention siblings build-snapshot wrote (post-PR #3).
+# Includes the retention siblings build-snapshot wrote.
 cp "$OUT"/catalogs/onym-services*.json "$OUT"/catalogs/onym-services*.json.sig "$SERVE_DIR/catalogs/"
 cp "$OUT"/manifests/*.json "$OUT"/manifests/*.json.sig "$SERVE_DIR/manifests/"
 cp "$POLICY" "$SERVE_DIR/policies/onym-services.md"

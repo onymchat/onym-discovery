@@ -99,6 +99,10 @@ write_if_changed() {
         rm -f "$tmp"
         return 0
     fi
+    # mktemp creates 0600; these are world-readable config files (the
+    # snippet is bind-mounted into the caddy container, the override is
+    # read by compose), so open them up before moving into place.
+    chmod 644 "$tmp"
     mv "$tmp" "$path"
     changed=1
 }
@@ -172,9 +176,17 @@ cd "$INFRA_DIR"
 # (image `caddy:2-alpine`, nothing baked in) — and our override above
 # bind-mounts caddy.d the same way, so the throwaway `compose run`
 # container sees exactly the effective config the running one will load.
+#
+# Arg-form asymmetry, deliberate: `compose run` funnels its arguments
+# through the image ENTRYPOINT, which for caddy:2-alpine is already the
+# `caddy` binary — so the arguments must start at the SUBcommand
+# (`validate ...`, not `caddy validate ...`, which would exec
+# `caddy caddy validate` and always fail). `compose exec` below is the
+# opposite: it bypasses the entrypoint and runs the argv verbatim inside
+# the container, so there the `caddy` binary must be spelled out.
 info "validating Caddy config..."
 if ! docker compose run --rm --no-deps -T caddy \
-        caddy validate --config /etc/caddy/Caddyfile; then
+        validate --config /etc/caddy/Caddyfile; then
     rollback
     die "Caddy config validation failed — rolled back; the running Caddy is untouched"
 fi

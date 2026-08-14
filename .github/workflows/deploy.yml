@@ -39,6 +39,14 @@ name: Deploy
 #   DROPLET_NAME     onym-infra    (adopted by name, as onym-infra does)
 #   DROPLET_ID       unset         (set it to pin the exact box; printed
 #                                   in the job summary)
+#   DROPLET_HOST_FINGERPRINT
+#                    unset         (RECOMMENDED: the droplet's SSH host
+#                                   key fingerprint, "SHA256:..." from
+#                                   `ssh-keygen -lf <(ssh-keyscan <ip>)`;
+#                                   when set, ci-deploy.sh dies if the
+#                                   deploy-time scan mismatches. Unset
+#                                   degrades to trust-on-first-scan with
+#                                   a logged warning)
 
 on:
   workflow_dispatch:
@@ -162,5 +170,6 @@ jobs:
           DOMAIN: ${{ vars.DOMAIN || 'onym.app' }}
           DROPLET_NAME: ${{ vars.DROPLET_NAME || 'onym-infra' }}
           DROPLET_ID: ${{ vars.DROPLET_ID }}
+          DROPLET_HOST_FINGERPRINT: ${{ vars.DROPLET_HOST_FINGERPRINT }}
           SERVE_DIR: ${{ runner.temp }}/serve
         run: SSH_KEY_PATH="$HOME/.ssh/deploy_key" ./deploy/onym/ci-deploy.sh

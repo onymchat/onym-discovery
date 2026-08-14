@@ -1,4 +1,6 @@
-reviewed/*.json
+# reviewed/*.json is COMMITTED on purpose: the digests pinned in the
+# catalog config must correspond to bytes anyone can review, and the
+# committed copy IS the audit record of the review that was performed.
 # CI-built signing output — scratch, never committed. Pre-signed
 # artifacts for skip_signing deploys are committed under signed/ instead.
 out/

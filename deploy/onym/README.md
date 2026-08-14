@@ -102,6 +102,12 @@ curl -fsS https://moderation.onym.app/manifest.json > reviewed/onym-authority.js
 # read them; the digest you pin is the review you performed
 ```
 
+**Commit the `reviewed/` files.** They are tracked on purpose: the
+digests pinned in `catalogs/onym-services.config.json` must correspond
+to bytes anyone can inspect, and the committed copy is the audit record
+of the review you performed. (CI-signing builds also read them from the
+checkout — a signing run fails fast if they are missing.)
+
 ## Publishing from CI (the default path)
 
 `.github/workflows/deploy.yml` runs the publish from a manual
@@ -141,6 +147,12 @@ Secrets it needs, matching onym-infra's names where they already exist:
 | `COURIER_OPERATOR_SEED` | **you must generate and add** (64 hex chars) |
 | `BLOSSOM_OPERATOR_SEED` | **you must generate and add** (64 hex chars) |
 
+And one **variable** (not a secret) you should set:
+
+| Variable | Status |
+|---|---|
+| `DROPLET_HOST_FINGERPRINT` | **recommended** — the droplet's SSH host key fingerprint (`SHA256:...`, from `ssh-keygen -lf <(ssh-keyscan <droplet-ip>)`, recorded from a network you trust). When set, the deploy dies if the deploy-time `ssh-keyscan` returns a different key; when unset, the deploy trusts whatever key the first scan returns (TOFU) and logs a warning. |
+
 Generate each seed with `onym-discovery keygen --out <name>.seed`; the
 secret value is the file's single 64-hex-char line. Publish the printed
 fingerprints out of band. The seed files themselves stay out of this
@@ -159,10 +171,13 @@ is reduced to verify + transport — it holds no signing material at all.
 artifacts live in `signed/` precisely so the two never mix.) Either way
 the verify gate runs before a byte leaves the runner.
 
-CI hard-fails, with the reason, when: a `REPLACE-*` placeholder is still
-unfilled; `policies/onym-services.md`, `privacy.md`, or the `reviewed/`
-manifests are missing; a pinned digest does not match the bytes being
-served; a seed secret is unset (and `skip_signing` is not); or the live
+CI hard-fails, with the reason, when: `policies/onym-services.md` or
+`privacy.md` is missing (they are served in both modes) or a pinned
+digest does not match their bytes; a `REPLACE-*` placeholder is still
+unfilled or the committed `reviewed/` manifests are missing (signing
+runs only — a `skip_signing` deploy reads neither, it needs the
+committed `signed/` tree, whose completeness is checked instead); a
+seed secret is unset (and `skip_signing` is not); or the live
 snapshot cannot be fetched — for any reason, including DNS failure —
 without `genesis: true`. A fetch failure is never read as "nothing
 published yet": with `genesis: false`, **every** failure path aborts,
@@ -183,13 +198,13 @@ the Cloudflare zone before deciding:
   elsewhere, a snapshot answering on the droplet, or no way to perform
   the check — aborts rather than fork the sequence chain.
 
-Note for after PR #3 lands (retention siblings + `--sig` verify flags):
-`build-snapshot` will start writing `onym-services-<sequence>.json`
-retention siblings itself, and the verify gate in `ci-assemble.sh`
-should grow `--sig <file>.sig` on both `verify` calls so the detached
-signatures are checked for agreement too. Until then CI preserves any
-already-published siblings by fetching them and by never rsyncing with
-`--delete`.
+The verify gate passes `--sig` on both `verify` calls, so the detached
+`.sig` files are checked for agreement with the embedded signatures —
+which matters most under `skip_signing: true`, where the committed
+`signed/*.sig` bytes would otherwise ship unchecked. `build-snapshot`
+writes the `onym-services-<sequence>.json` retention sibling itself; CI
+additionally preserves siblings published by older tooling by fetching
+them, and never rsyncs with `--delete`.
 
 ## Each publish (manual runbook — the alternative)
 

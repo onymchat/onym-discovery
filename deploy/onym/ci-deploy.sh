@@ -20,6 +20,11 @@
 #   DOMAIN           Cloudflare zone, default onym.app
 #   DROPLET_ID       reuse a specific droplet; else resolved by name
 #   DROPLET_NAME     default onym-infra
+#   DROPLET_HOST_FINGERPRINT
+#                    optional but recommended: the droplet's SSH host key
+#                    fingerprint ("SHA256:..."); when set, the deploy-time
+#                    ssh-keyscan must match it or the deploy dies. Unset
+#                    falls back to trust-on-first-scan with a warning.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -39,7 +44,7 @@ warn() { printf '==> WARNING: %s\n' "$*" >&2; }
 err()  { printf '==> ERROR: %s\n' "$*" >&2; }
 die()  { err "$@"; exit 1; }
 
-for c in doctl ssh ssh-keyscan rsync curl python3 dig; do
+for c in doctl ssh ssh-keyscan ssh-keygen rsync curl python3 dig; do
     command -v "$c" >/dev/null || die "missing required command: $c"
 done
 [ -d "$SERVE_DIR" ] || die "SERVE_DIR not found: $SERVE_DIR (run ci-assemble.sh first)"
@@ -68,13 +73,37 @@ fi
 DROPLET_IP="$(doctl compute droplet get "$DROPLET_ID" --format PublicIPv4 --no-header)"
 info "droplet $DROPLET_ID ($DROPLET_IP)"
 
-# Pin the droplet's host key instead of disabling host-key checking:
-# scan the resolved IP once, write a private known_hosts, and require a
-# match for every subsequent ssh/rsync in this run.
+# Host key: scan the resolved IP once, write a private known_hosts, and
+# require a match for every subsequent ssh/rsync in this run.
+#
+# When DROPLET_HOST_FINGERPRINT is set (a "SHA256:..." fingerprint from
+# `ssh-keygen -lf <(ssh-keyscan <ip>)` recorded out of band), the
+# scanned key must match it — genuine pinning: an attacker on the path
+# at deploy time cannot substitute a key. When unset this degrades to
+# trust-on-first-scan (TOFU): consistent within the run, but the scan
+# itself trusts whatever answers, so set the variable.
 KNOWN_HOSTS="$(mktemp)"
 trap 'rm -f "$KNOWN_HOSTS"' EXIT
 ssh-keyscan -T 15 "$DROPLET_IP" > "$KNOWN_HOSTS" 2>/dev/null
 [ -s "$KNOWN_HOSTS" ] || die "ssh-keyscan got no host key from $DROPLET_IP — is sshd up?"
+if [ -n "${DROPLET_HOST_FINGERPRINT:-}" ]; then
+    scanned="$(ssh-keygen -lf "$KNOWN_HOSTS" | awk '{print $2}')"
+    if ! printf '%s\n' "$scanned" | grep -qxF "$DROPLET_HOST_FINGERPRINT"; then
+        die "host key fingerprint mismatch for $DROPLET_IP.
+  expected (DROPLET_HOST_FINGERPRINT): $DROPLET_HOST_FINGERPRINT
+  scanned:
+$(printf '%s\n' "$scanned" | sed 's/^/    /')
+  Either the droplet was rebuilt (update the variable) or something on
+  the path is answering with a different key. NOT deploying."
+    fi
+    info "host key fingerprint matches DROPLET_HOST_FINGERPRINT"
+else
+    warn "DROPLET_HOST_FINGERPRINT is not set — trusting the host key from
+  this run's ssh-keyscan (TOFU). Record the fingerprint once with
+    ssh-keygen -lf <(ssh-keyscan $DROPLET_IP)
+  and set it as the DROPLET_HOST_FINGERPRINT repository variable so future
+  deploys verify the droplet's identity instead of trusting the network."
+fi
 SSH_OPTS=(-o StrictHostKeyChecking=yes -o "UserKnownHostsFile=$KNOWN_HOSTS" -o ConnectTimeout=15 -i "$SSH_KEY_PATH")
 # shellcheck disable=SC2029  # client-side expansion of the command is intended
 ssh_do() { ssh "${SSH_OPTS[@]}" "root@$DROPLET_IP" "$@"; }
@@ -238,24 +267,36 @@ fi
 
 # ─── Health: the live bytes must be the bytes we assembled ────────────
 
-info "checking https://$DISCOVERY_HOST/manifest.json serves the deployed bytes..."
+info "checking https://$DISCOVERY_HOST serves the deployed bytes (manifest + snapshot)..."
 sha() { python3 -c 'import hashlib,sys; print(hashlib.sha256(open(sys.argv[1],"rb").read()).hexdigest())' "$1"; }
-want="$(sha "$SERVE_DIR/manifest.json")"
+# The snapshot is the document clients actually chain on; check it
+# byte-for-byte alongside the manifest so a partial rsync or a stale
+# cache of either file fails the deploy.
+health_paths=(manifest.json catalogs/onym-services.json)
 live="$(mktemp)"
 healthy=false
 for i in $(seq 1 36); do
-    if curl -fsS --connect-timeout 10 -o "$live" "https://$DISCOVERY_HOST/manifest.json" \
-        && [ "$(sha "$live")" = "$want" ]; then
+    all_ok=true
+    for path in "${health_paths[@]}"; do
+        want="$(sha "$SERVE_DIR/$path")"
+        if ! curl -fsS --connect-timeout 10 -o "$live" "https://$DISCOVERY_HOST/$path" \
+            || [ "$(sha "$live")" != "$want" ]; then
+            all_ok=false
+            break
+        fi
+    done
+    if [ "$all_ok" = "true" ]; then
         healthy=true
         break
     fi
     [ "$i" -eq 36 ] || sleep 10
 done
 if [ "$healthy" = "true" ]; then
-    info "live and byte-identical: https://$DISCOVERY_HOST/manifest.json"
+    info "live and byte-identical: https://$DISCOVERY_HOST/{manifest.json,catalogs/onym-services.json}"
 else
-    die "https://$DISCOVERY_HOST/manifest.json is not serving the deployed bytes
-  after 6 minutes. On a FIRST deploy this is usually Let's Encrypt issuance
+    die "https://$DISCOVERY_HOST is not serving the deployed bytes after 6
+  minutes (checked manifest.json and catalogs/onym-services.json byte-for-
+  byte). On a FIRST deploy this is usually Let's Encrypt issuance
   still catching up after the fresh DNS record — check:
     ssh root@$DROPLET_IP 'cd /opt/onym-infra && docker compose logs caddy | tail -50'
   and re-run the workflow once the certificate is issued."
@@ -266,6 +307,7 @@ if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
         echo "### discovery.onym.app deploy"
         echo "- droplet: \`$DROPLET_ID\` ($DROPLET_IP) — set the DROPLET_ID variable to pin it"
         echo "- web root: \`$WEB_ROOT\`"
-        echo "- manifest sha256: \`$want\`"
+        echo "- manifest sha256: \`$(sha "$SERVE_DIR/manifest.json")\`"
+        echo "- snapshot sha256: \`$(sha "$SERVE_DIR/catalogs/onym-services.json")\`"
     } >> "$GITHUB_STEP_SUMMARY"
 fi
