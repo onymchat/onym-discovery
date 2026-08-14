@@ -380,7 +380,10 @@ fn missing_required_privacy_or_policy_fields_rejected() {
     }
     let mut doc: Value = serde_json::from_slice(&provider_manifest_bytes()).unwrap();
     doc.as_object_mut().unwrap().remove("signature");
-    doc["catalogs"][0].as_object_mut().unwrap().remove("policyUri");
+    doc["catalogs"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("policyUri");
     let signed = sign_document(&serde_json::to_vec(&doc).unwrap(), &key()).unwrap();
     let err = verify_manifest(&signed, VERIFY_AT).unwrap_err();
     assert_eq!(err.code(), Some("provider_manifest_invalid"));
@@ -394,7 +397,13 @@ fn expiry_skew_boundary() {
     let (_, s1, ..) = build_chain();
     let expires_at = datetime!(2026-09-12 00:00:00 UTC);
     // Exactly 10 minutes past expiry: within the skew allowance.
-    verify_snapshot(&s1, &manifest, None, expires_at + time::Duration::minutes(10)).unwrap();
+    verify_snapshot(
+        &s1,
+        &manifest,
+        None,
+        expires_at + time::Duration::minutes(10),
+    )
+    .unwrap();
     // One second beyond the allowance: snapshot_expired.
     let err = verify_snapshot(
         &s1,
