@@ -17,7 +17,47 @@
 # them back. The durable home for this vhost is onym-infra itself — once
 # it grows a native {$DISCOVERY_HOST} block this script detects that and
 # steps aside.
+#
+# STDIN IS THE SCRIPT. Because ci-deploy.sh streams this file into
+# `bash -s`, bash reads it from stdin incrementally as it executes.
+# Any child command that reads (or merely attaches and drains) stdin
+# eats the REST OF THE SCRIPT: bash then sees EOF and exits 0 mid-way.
+# That is exactly what sank genesis run 31872313566 — `docker compose
+# run -T ... caddy validate` attached the streamed stdin to the
+# throwaway container and drained it, so the script silently ended
+# right after "Valid configuration": `up -d` and the reload never ran,
+# the live container kept its old mounts, and the vhost never loaded.
+# Two defenses, both deliberate:
+#   1. the whole script body lives in main(), so bash must parse it all
+#      before executing anything — a drained stdin can no longer
+#      truncate execution;
+#   2. every docker invocation gets an explicit `</dev/null`, so no
+#      child can drain the stream in the first place (belt AND braces —
+#      keep both when editing).
 set -euo pipefail
+
+info() { printf '==> %s\n' "$*"; }
+err()  { printf '==> ERROR: %s\n' "$*" >&2; }
+die()  { err "$@"; exit 1; }
+
+# True when the RUNNING caddy container has both vhost mounts from our
+# compose override (/etc/caddy/caddy.d and /srv/discovery). False when
+# the container is absent, or is an old instance created before the
+# override existed — the failure mode of genesis run 31872313566, where
+# the files on disk were perfect but the live container had never been
+# recreated to pick them up.
+caddy_has_vhost_mounts() {
+    local cid mounts
+    cid="$(docker compose ps -q caddy </dev/null)" || return 1
+    [ -n "$cid" ] || return 1
+    mounts="$(docker inspect \
+        --format '{{range .Mounts}}{{.Destination}}{{"\n"}}{{end}}' \
+        "$cid" </dev/null)" || return 1
+    grep -qxF '/etc/caddy/caddy.d' <<<"$mounts" \
+        && grep -qxF '/srv/discovery' <<<"$mounts"
+}
+
+main() {
 
 HOST="${1:-discovery.onym.app}"
 INFRA_DIR="${INFRA_DIR:-/opt/onym-infra}"
@@ -27,10 +67,6 @@ SNIPPET="$SNIPPET_DIR/discovery.caddy"
 OVERRIDE="$INFRA_DIR/docker-compose.override.yml"
 CADDYFILE="$INFRA_DIR/Caddyfile"
 IMPORT_LINE='import /etc/caddy/caddy.d/*.caddy'
-
-info() { printf '==> %s\n' "$*"; }
-err()  { printf '==> ERROR: %s\n' "$*" >&2; }
-die()  { err "$@"; exit 1; }
 
 [ -d "$INFRA_DIR" ] || die "$INFRA_DIR not found — is this the onym-infra droplet?"
 [ -f "$CADDYFILE" ] || die "$CADDYFILE not found — has onym-infra's deploy run here?"
@@ -159,12 +195,19 @@ if ! grep -qF "$IMPORT_LINE" "$CADDYFILE"; then
     changed=1
 fi
 
-if [ "$changed" -eq 0 ]; then
-    info "Caddy vhost for $HOST already in place — no-op"
+cd "$INFRA_DIR"
+
+# "Nothing changed on disk" is NOT the same as "the site is up": genesis
+# run 31872313566 left exactly this state — files perfect, but the live
+# container predated the override and had neither mount, so the vhost
+# never loaded. A plain files-only no-op here would have made every
+# subsequent deploy exit 0 while the site stayed dark. Only no-op when
+# the RUNNING container also carries the mounts; otherwise fall through
+# and recreate it.
+if [ "$changed" -eq 0 ] && caddy_has_vhost_mounts; then
+    info "Caddy vhost for $HOST already in place (files AND running container) — no-op"
     exit 0
 fi
-
-cd "$INFRA_DIR"
 
 # Validate the merged config in a throwaway container BEFORE touching
 # the running one: every other onym.app vhost rides on this Caddy, and a
@@ -184,41 +227,96 @@ cd "$INFRA_DIR"
 # claimed the image had ENTRYPOINT ["caddy"] and this line was changed
 # to bare `validate ...`, which failed in run 31872186177 with
 # 'exec: "validate": not found' — trust the inspect, not the docs.)
+#
+# The `</dev/null` is load-bearing: without it, compose run attaches
+# the ssh-streamed script (our stdin) to the container and drains it —
+# see the header comment.
 info "validating Caddy config..."
 if ! docker compose run --rm --no-deps -T caddy \
-        caddy validate --config /etc/caddy/Caddyfile; then
+        caddy validate --config /etc/caddy/Caddyfile </dev/null; then
     rollback
     die "Caddy config validation failed — rolled back; the running Caddy is untouched"
 fi
 
-# `up -d` recreates the container when the override changed (new
-# mounts); the explicit reload covers the remaining case where only the
-# bind-mounted snippet bytes changed and compose sees no diff. If the
-# container WAS just recreated it may still be starting, so the reload
-# can race its admin socket — retry with a short backoff instead of
-# failing the deploy on a race. The config already passed validation, so
-# a persistent reload failure is an environment problem: roll the files
-# back (and best-effort reload the restored config) rather than leave
-# on-disk state that the running Caddy never accepted.
-info "applying: 'docker compose up -d caddy' may now RECREATE the SHARED Caddy"
-info "  container — it fronts EVERY onym.app vhost (relayer wss://, moderation,"
-info "  the works), so open WebSocket connections will drop and reconnect."
-info "  Validation above guarded the config, not this restart."
-docker compose up -d caddy
-reloaded=false
-for attempt in 1 2 3 4 5; do
-    if docker compose exec -T caddy caddy reload --config /etc/caddy/Caddyfile; then
-        reloaded=true
-        break
-    fi
-    [ "$attempt" -eq 5 ] || { info "  reload attempt $attempt failed — retrying in 2s..."; sleep 2; }
-done
-if [ "$reloaded" != "true" ]; then
-    rollback
-    docker compose exec -T caddy caddy reload --config /etc/caddy/Caddyfile || true
-    die "caddy reload failed after 5 attempts — rolled back the vhost files
+if [ "$changed" -ne 0 ]; then
+    # `up -d` recreates the container when the override changed (new
+    # mounts); the explicit reload covers the remaining case where only
+    # the bind-mounted snippet bytes changed and compose sees no diff.
+    # If the container WAS just recreated it may still be starting, so
+    # the reload can race its admin socket — retry with a short backoff
+    # instead of failing the deploy on a race. The config already passed
+    # validation, so a persistent reload failure is an environment
+    # problem: roll the files back (and best-effort reload the restored
+    # config) rather than leave on-disk state that the running Caddy
+    # never accepted.
+    info "applying: 'docker compose up -d caddy' may now RECREATE the SHARED Caddy"
+    info "  container — it fronts EVERY onym.app vhost (relayer wss://, moderation,"
+    info "  the works), so open WebSocket connections will drop and reconnect."
+    info "  Validation above guarded the config, not this restart."
+    docker compose up -d caddy </dev/null
+    reloaded=false
+    for attempt in 1 2 3 4 5; do
+        if docker compose exec -T caddy \
+                caddy reload --config /etc/caddy/Caddyfile </dev/null; then
+            reloaded=true
+            break
+        fi
+        [ "$attempt" -eq 5 ] || { info "  reload attempt $attempt failed — retrying in 2s..."; sleep 2; }
+    done
+    if [ "$reloaded" != "true" ]; then
+        rollback
+        docker compose exec -T caddy \
+            caddy reload --config /etc/caddy/Caddyfile </dev/null || true
+        die "caddy reload failed after 5 attempts — rolled back the vhost files
   and re-issued a reload of the restored config. Inspect the container:
   cd $INFRA_DIR && docker compose logs caddy | tail -50"
+    fi
 fi
 
+# ASSERT the applied state before letting ci-deploy.sh proceed to DNS
+# and the health check — "the compose commands exited 0" has already
+# proven insufficient once. Two checks:
+#
+# 1. The RUNNING container must carry both override mounts. If it does
+#    not (compose somehow kept the old container), force-recreate once
+#    and re-check; still missing means something is deeply wrong (an
+#    explicit COMPOSE_FILE excluding the override, a renamed base file
+#    breaking override auto-loading, ...) and we die loudly rather than
+#    hand ci-deploy a droplet that cannot serve the vhost.
+if ! caddy_has_vhost_mounts; then
+    info "running caddy container is missing the vhost mounts — forcing recreate..."
+    info "  (this restarts the SHARED Caddy fronting every onym.app vhost)"
+    docker compose up -d --force-recreate caddy </dev/null
+    caddy_has_vhost_mounts || die "caddy container STILL lacks the vhost mounts
+  (/etc/caddy/caddy.d and $WEB_ROOT->/srv/discovery) after a forced
+  recreate. Compose is not seeing $OVERRIDE — check for an explicit
+  COMPOSE_FILE / -f selection in $INFRA_DIR that excludes the override.
+  Inspect: cd $INFRA_DIR && docker compose config caddy
+       and: docker inspect \$(docker compose ps -q caddy) --format '{{.Mounts}}'"
+fi
+
+# 2. The config must be loadable AS THE RUNNING CONTAINER SEES IT:
+#    `caddy validate` via exec re-adapts /etc/caddy/Caddyfile inside
+#    the live filesystem, so it fails if the import glob's caddy.d
+#    mount is stale/absent — the exact silent gap of run 31872313566
+#    (an unmatched `import` glob is not an error, so the old container
+#    validated fine while serving nothing). A positive "is the vhost
+#    answering" probe is deliberately NOT done from inside the
+#    container: Caddy answers HTTP with a redirect to https://$HOST,
+#    which pre-DNS resolves nowhere, and busybox wget can't inspect a
+#    status without following it. ci-deploy.sh already curls the
+#    droplet IP with the Host header immediately after this script, so
+#    the end-to-end probe lives there. (exec argv spells out `caddy`:
+#    the image has NO entrypoint — ENTRYPOINT=[], verified above.)
+info "verifying the running container loads the merged config..."
+docker compose exec -T caddy \
+        caddy validate --config /etc/caddy/Caddyfile </dev/null \
+    || die "the RUNNING caddy container cannot validate /etc/caddy/Caddyfile —
+  its mounts are present but the config does not load inside it. Do not
+  proceed. Inspect: cd $INFRA_DIR && docker compose logs caddy | tail -50"
+
 info "Caddy vhost for $HOST ensured (root $WEB_ROOT)"
+
+}
+
+main "$@"
