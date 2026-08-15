@@ -26,7 +26,7 @@
         "uri": "https://relayer.onym.app/manifest.json"
       },
       "manifestFile": "../reviewed/onym-relayer.json",
-      "operator": "onym:key:REPLACE-RELAYER-KEY",
+      "operator": "onym:key:8c836293161a3ee2e4c2e338851d88289a2db494efc6342d9fb7ac0c516936ad",
       "profiles": [
         "onym:notary-implementation:stellar-soroban-sep-plonk-v1"
       ],
