@@ -2,7 +2,7 @@
   "version": 1,
   "implementationProfileId": "onym:discovery-implementation:static-ed25519-v1",
   "providerId": "onym:component:onym-discovery",
-  "operator": "onym:key:REPLACE-OPERATOR-KEY",
+  "operator": "onym:key:42b0da001104dd03052c7feddab9520c920c9e40d11b245c46c27cf6be853f24",
   "seat": "discovery",
   "catalogs": [
     {
@@ -15,7 +15,7 @@
         "transport.message",
         "blob.storage"
       ],
-      "policy": "sha256:REPLACE-POLICY-DIGEST",
+      "policy": "sha256:735edc67068e9474ee177ad7e751ee1920be124b1a6fa357d8a058881450b8ac",
       "policyUri": "https://discovery.onym.app/policies/onym-services.md"
     }
   ],
@@ -23,7 +23,7 @@
     "signed-snapshot-v1",
     "local-filtering-v1"
   ],
-  "privacyProfile": "sha256:REPLACE-PRIVACY-DIGEST",
+  "privacyProfile": "sha256:39e0c676ce79f630d5f7e985435e6937880d88a5f33304e51a9e08483a9a28ed",
   "privacyProfileUri": "https://discovery.onym.app/privacy.md",
   "offers": [],
   "validUntil": "2027-08-13T00:00:00Z"

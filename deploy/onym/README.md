@@ -22,10 +22,39 @@ privacy.md                         # provider privacy profile
 
 The notary and moderation entries need no hosted manifest here: the
 relayer serves its own at `https://relayer.onym.app/manifest.json`
-(`RELAYER_OPERATOR_MANIFEST`), and the authority already serves
-`https://moderation.onym.app/manifest.json`. The courier and blossom
-manifests are hosted here because a WebSocket relay and a blob store
-have no natural HTTPS document root of their own.
+(`RELAYER_OPERATOR_MANIFEST`), and the authority serves
+`https://authority.onym.app/manifest.json`. (Not
+`moderation.onym.app` — that host is the interface enforcement service
+and correctly serves no manifest.) The courier and blossom manifests
+are hosted here because a WebSocket relay and a blob store have no
+natural HTTPS document root of their own.
+
+## Before first dispatch (genesis is BLOCKED until this is done)
+
+The templates, keys, digests, served documents, and the reviewed
+authority manifest are filled and committed, but **the genesis deploy
+cannot run yet**: `ci-assemble.sh`'s source-sanity gate requires both
+`reviewed/` manifests for any signing run, and one is still missing.
+
+**Relayer manifest (the one remaining blocker).**
+`https://relayer.onym.app/manifest.json` is not served until the
+onym-infra#15 deploy lands. Once it is live:
+
+```sh
+curl -fsS https://relayer.onym.app/manifest.json > reviewed/onym-relayer.json
+# READ IT — the digest you pin is the review you performed — then:
+git add reviewed/onym-relayer.json && git commit
+```
+
+Also confirm the manifest's operator key matches the one already pinned
+in `catalogs/onym-services.config.json`
+(`onym:key:8c836293161a3ee2e4c2e338851d88289a2db494efc6342d9fb7ac0c516936ad`).
+
+The authority manifest is already fetched from
+`https://authority.onym.app/manifest.json`, reviewed, and committed as
+`reviewed/onym-authority.json`; its operator key
+(`onym:key:bdec68a8440f36591dd822748f86fee3582794b3d20445b06953db6f266f3dca`)
+is pinned in the catalog config's authority entry.
 
 ## One-time setup
 
@@ -98,7 +127,7 @@ authority host their own manifests; you pin the bytes you reviewed:
 
 ```sh
 curl -fsS https://relayer.onym.app/manifest.json    > reviewed/onym-relayer.json
-curl -fsS https://moderation.onym.app/manifest.json > reviewed/onym-authority.json
+curl -fsS https://authority.onym.app/manifest.json > reviewed/onym-authority.json
 # read them; the digest you pin is the review you performed
 ```
 
@@ -221,7 +250,7 @@ onym-discovery sign-manifest --seed blossom.seed manifests/onym-blossom.src.json
 
 # 2. fetch and REVIEW the live external manifests, then pin their bytes
 curl -fsS https://relayer.onym.app/manifest.json  > reviewed/onym-relayer.json
-curl -fsS https://moderation.onym.app/manifest.json > reviewed/onym-authority.json
+curl -fsS https://authority.onym.app/manifest.json > reviewed/onym-authority.json
 # read them; the digest you pin is the review you performed
 
 # 3. backfill the retention siblings already published (§5) into signed/

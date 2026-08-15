@@ -2,7 +2,7 @@
   "version": 1,
   "componentId": "onym:component:onym-blossom",
   "seat": "blob.storage",
-  "operator": "onym:key:REPLACE-BLOSSOM-KEY",
+  "operator": "onym:key:e446f2b18e9f75e13397ebdff0f2e40610c9e745aa11308b04c8b607f7dea094",
   "implementationProfileId": "onym:blob-implementation:blossom-v1",
   "endpoints": [
     {
