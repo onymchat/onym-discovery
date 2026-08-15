@@ -2,7 +2,7 @@
   "version": 1,
   "componentId": "onym:component:onym-courier",
   "seat": "transport.message",
-  "operator": "onym:key:REPLACE-COURIER-KEY",
+  "operator": "onym:key:92500a19c43193c8945aa91b94878b0c986f2c4da500de4c2caea29103aaa84f",
   "messageProfileId": "onym:message-profile:opaque-topic-inbox-v1",
   "implementationProfileId": "onym:message-implementation:nostr-courier-v1",
   "endpoints": [
