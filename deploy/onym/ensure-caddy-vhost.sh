@@ -177,16 +177,16 @@ cd "$INFRA_DIR"
 # bind-mounts caddy.d the same way, so the throwaway `compose run`
 # container sees exactly the effective config the running one will load.
 #
-# Arg-form asymmetry, deliberate: `compose run` funnels its arguments
-# through the image ENTRYPOINT, which for caddy:2-alpine is already the
-# `caddy` binary — so the arguments must start at the SUBcommand
-# (`validate ...`, not `caddy validate ...`, which would exec
-# `caddy caddy validate` and always fail). `compose exec` below is the
-# opposite: it bypasses the entrypoint and runs the argv verbatim inside
-# the container, so there the `caddy` binary must be spelled out.
+# Empirically verified on the droplet (docker image inspect):
+# caddy:2-alpine has ENTRYPOINT=[] (none) and only a CMD — so
+# `compose run caddy <args>` executes <args> verbatim, and the argv
+# must spell out the binary: `caddy validate ...`. (An earlier review
+# claimed the image had ENTRYPOINT ["caddy"] and this line was changed
+# to bare `validate ...`, which failed in run 31872186177 with
+# 'exec: "validate": not found' — trust the inspect, not the docs.)
 info "validating Caddy config..."
 if ! docker compose run --rm --no-deps -T caddy \
-        validate --config /etc/caddy/Caddyfile; then
+        caddy validate --config /etc/caddy/Caddyfile; then
     rollback
     die "Caddy config validation failed — rolled back; the running Caddy is untouched"
 fi
