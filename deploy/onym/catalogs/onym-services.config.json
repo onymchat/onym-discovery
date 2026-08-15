@@ -5,6 +5,21 @@
   "expiryDays": 30,
   "entries": [
     {
+      "componentId": "onym:component:onym-authority",
+      "seatType": "moderation",
+      "manifest": {
+        "uri": "https://authority.onym.app/manifest.json"
+      },
+      "manifestFile": "../reviewed/onym-authority.json",
+      "operator": "onym:key:bdec68a8440f36591dd822748f86fee3582794b3d20445b06953db6f266f3dca",
+      "profiles": [
+        "onym:moderation-profile:consent-bound-v1"
+      ],
+      "listedAt": "2026-08-13T00:00:00Z",
+      "relationship": "common-owner",
+      "placement": "policy-ranked"
+    },
+    {
       "componentId": "onym:component:onym-relayer",
       "seatType": "notary",
       "manifest": {
