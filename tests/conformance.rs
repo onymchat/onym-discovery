@@ -324,6 +324,20 @@ fn escaping_input() -> &'static [u8] {
     br#"{"controls": "\u0001\u001F", "delete": "\u007F", "quote": "q\"b\\e", "slash": "a/b", "twochar": "\b\f\n\r\t", "unicode": "h\u00E9llo \u2192 \u65E5\u672C", "signature": "SIG"}"#
 }
 
+fn foundation_vectors_input() -> &'static [u8] {
+    // Companion fixture for `ServiceManifestCanonical` in onym-ios's
+    // OnymFoundation package -- the Swift twin of this crate's
+    // canonicalizer. One document combining the exact divergence
+    // classes the twin exists for: case-divergent keys
+    // (`seatID`/`seatable` -- byte order vs Foundation's
+    // case-insensitive sort), numeric-looking keys (`relay10`/`relay2`),
+    // a control character, and a non-ASCII string. onym-ios copies
+    // this input/bytes pair verbatim and asserts byte equality, so
+    // "change one, change both" is enforced by Rust-emitted bytes on
+    // both sides.
+    br#"{"seatable": {"relay2": "b", "relay10": "a"}, "seatID": "onym:component:courier", "note": "caf\u00E9 \u0001 end", "signature": "SIG"}"#
+}
+
 fn duplicate_keys_input() -> &'static [u8] {
     // §3: a document with duplicate keys is invalid — at any depth.
     br#"{"alpha": {"k": 1, "k": 2}, "signature": "SIG"}"#
@@ -376,6 +390,14 @@ fn fixtures_match_or_regenerate() {
         (
             "canonical-escaping-bytes.bin",
             signing_bytes(escaping_input()).unwrap(),
+        ),
+        (
+            "foundation-vectors-input.json",
+            foundation_vectors_input().to_vec(),
+        ),
+        (
+            "foundation-vectors-bytes.bin",
+            signing_bytes(foundation_vectors_input()).unwrap(),
         ),
         ("duplicate-keys-input.json", duplicate_keys_input().to_vec()),
         (
