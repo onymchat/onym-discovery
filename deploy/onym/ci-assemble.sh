@@ -157,6 +157,61 @@ if problems:
 PY
 fi
 
+# ─── Reviewed-manifest freshness (signing runs only) ──────────────────
+#
+# Catalog entries whose manifestFile lives under reviewed/ pin the
+# sha256 of the COMMITTED bytes — and those must be the bytes the seat
+# is actually serving. onym-infra can change them out from under this
+# repo: its deploy re-materializes and re-signs the authority manifest
+# on every run (and the relayer image ships its own), so an authority
+# redeploy that adds fields or rotates a key silently breaks the pin
+# for every client until the document is re-reviewed here. Catch that
+# before anything is signed:
+#
+#   - live bytes differ from the committed review  -> HARD FAILURE:
+#     re-fetch, RE-READ, commit (the digest you pin is the review you
+#     performed — never auto-adopt live bytes at build time);
+#   - the live document cannot be fetched          -> warning only: the
+#     committed review stands on its own, and a transient seat outage
+#     must not block publishing an otherwise correct snapshot.
+if [ "$SKIP_SIGNING" != "true" ]; then
+    info "checking committed reviewed/ manifests against the live documents..."
+    while IFS="$(printf '\t')" read -r file uri; do
+        live="$WORK/reviewed-live.json"
+        if ! curl -fsS --connect-timeout 15 --max-time 30 -o "$live" "$uri"; then
+            err "warning: could not fetch $uri — cannot confirm $(basename "$file") still matches the live document; the committed review is what gets pinned"
+            continue
+        fi
+        cmp -s "$live" "$file" || die "the live document at $uri no longer matches the committed
+  $file — the seat was redeployed with different manifest bytes since the
+  review was performed, and a snapshot pinning the stale digest would be
+  rejected by every client that fetches the live manifest. Re-fetch it,
+  READ it (the digest you pin is the review you performed), commit the
+  new bytes, and re-run:
+    curl -fsS $uri > $file
+    git add $file && git commit"
+        info "  $(basename "$file") matches $uri"
+    done < <(python3 - "$CONFIG" <<'PY'
+import json, os, sys
+
+config_path = sys.argv[1]
+config_dir = os.path.dirname(os.path.abspath(config_path))
+reviewed_dir = os.path.normpath(os.path.join(config_dir, "..", "reviewed"))
+
+with open(config_path) as handle:
+    config = json.load(handle)
+for entry in config.get("entries", []):
+    path = entry.get("manifestFile")
+    uri = (entry.get("manifest") or {}).get("uri")
+    if path is None or uri is None:
+        continue
+    absolute = os.path.normpath(os.path.join(config_dir, path))
+    if os.path.dirname(absolute) == reviewed_dir:
+        print(absolute + "\t" + uri)
+PY
+)
+fi
+
 if [ ! -x "$BIN" ]; then
     info "building release CLI..."
     (cd "$REPO_ROOT" && cargo build --release --locked)
