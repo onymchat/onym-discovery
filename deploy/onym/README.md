@@ -29,32 +29,57 @@ and correctly serves no manifest.) The courier and blossom manifests
 are hosted here because a WebSocket relay and a blob store have no
 natural HTTPS document root of their own.
 
-## Before first dispatch (genesis is BLOCKED until this is done)
+## Before the genesis dispatch
 
-The templates, keys, digests, served documents, and the reviewed
-authority manifest are filled and committed, but **the genesis deploy
-cannot run yet**: `ci-assemble.sh`'s source-sanity gate requires both
-`reviewed/` manifests for any signing run, and one is still missing.
+The templates, keys, digests, served documents, and **both** reviewed
+manifests are filled and committed (`reviewed/onym-relayer.json` landed
+with #8), so the source-sanity gate no longer blocks a signing run.
+Three things still gate the first dispatch:
 
-**Relayer manifest (the one remaining blocker).**
-`https://relayer.onym.app/manifest.json` is not served until the
-onym-infra#15 deploy lands. Once it is live:
+**1. The reviewed manifests must match what the seats serve TODAY.**
+`ci-assemble.sh` now enforces this on every signing run: it fetches
+each externally hosted manifest (`authority.onym.app`,
+`relayer.onym.app`) and hard-fails when the live bytes differ from the
+committed `reviewed/` copy. In particular, an onym-infra workstream is
+changing the **authority manifest bytes** (embedded signature, name,
+endpoints); after that deploy lands, refresh the review **before**
+dispatching:
 
 ```sh
-curl -fsS https://relayer.onym.app/manifest.json > reviewed/onym-relayer.json
+curl -fsS https://authority.onym.app/manifest.json > reviewed/onym-authority.json
 # READ IT — the digest you pin is the review you performed — then:
-git add reviewed/onym-relayer.json && git commit
+git add reviewed/onym-authority.json && git commit
 ```
 
-Also confirm the manifest's operator key matches the one already pinned
-in `catalogs/onym-services.config.json`
-(`onym:key:8c836293161a3ee2e4c2e338851d88289a2db494efc6342d9fb7ac0c516936ad`).
+The snapshot itself needs no manual rebuild for the default CI-signing
+path: it is built **at publish time**, chained onto the previously
+published bytes, from whatever `reviewed/` bytes are committed. (Only
+the `skip_signing` path bakes the snapshot early — there the local
+runbook below must be re-run after any `reviewed/` refresh.)
 
-The authority manifest is already fetched from
-`https://authority.onym.app/manifest.json`, reviewed, and committed as
-`reviewed/onym-authority.json`; its operator key
-(`onym:key:bdec68a8440f36591dd822748f86fee3582794b3d20445b06953db6f266f3dca`)
-is pinned in the catalog config's authority entry.
+**2. Which genesis path the run takes depends on onym-infra#20.**
+A Cloudflare A record for `discovery.onym.app` already points at the
+droplet while nothing is served, so today the host resolves and the
+TLS handshake fails. With `genesis: true`:
+
+- **onym-infra#20 deployed first (preferred):** the native Caddy vhost
+  answers a clean HTTP 404, and genesis proceeds on the ordinary
+  clean-404 path (the A-record cross-check proves the 404 came from
+  our own droplet via `DROPLET_IP`, which CI resolves).
+- **Without it:** the fetch fails at the TLS handshake and the run
+  leans on the strict genesis **recovery** path — every A record must
+  point at our droplet and nothing may be fetchable from it directly.
+  That currently holds, so the run proceeds with a loud warning, but
+  the clean path is the one to prefer.
+
+**3. The `production` environment must be protected** (required
+reviewers added) before the first dispatch — see "One-time setup",
+step 1.
+
+The operator keys pinned in `catalogs/onym-services.config.json` were
+confirmed against the reviewed manifests: authority
+`onym:key:bdec68a8…f3dca` and relayer `onym:key:8c8362…936ad` match
+the `operator` field of their committed `reviewed/*.json` bytes.
 
 ## One-time setup
 
@@ -153,6 +178,14 @@ then upserts the grey-cloud Cloudflare A record — DNS is the last state
 a deploy creates, so a mid-run failure never leaves a public name
 pointing at a half-configured host.
 
+**Once onym-infra serves the vhost natively** (onym-infra#20: a
+`{$DISCOVERY_HOST}` site block, the `/var/www/discovery` mount, and the
+DNS record all live in onym-infra's own deploy), `ensure-caddy-vhost.sh`
+detects the native block and steps aside as a no-op — the restart risk
+below and the override-sweep dance become historical. The paragraphs
+stay because the stopgap remains the fallback whenever the discovery
+deploy runs against a droplet whose onym-infra predates that PR.
+
 **Risk: the vhost step restarts the shared proxy.** `ensure-caddy-vhost.sh`
 applies its changes with `docker compose up -d caddy`, which **recreates
 the Caddy container whenever the compose override changed** — and that
@@ -171,16 +204,16 @@ Secrets it needs, matching onym-infra's names where they already exist:
 |---|---|
 | `DO_API_KEY` | org-level, exists |
 | `CF_API_TOKEN` | org-level, exists |
-| `SSH_PRIVATE_KEY` | the key the droplet trusts — same secret onym-infra deploys with |
-| `DISCOVERY_OPERATOR_SEED` | **you must generate and add** (64 hex chars) |
-| `COURIER_OPERATOR_SEED` | **you must generate and add** (64 hex chars) |
-| `BLOSSOM_OPERATOR_SEED` | **you must generate and add** (64 hex chars) |
+| `SSH_PRIVATE_KEY` | repo-level, exists — the key the droplet trusts (same key onym-infra deploys with) |
+| `DISCOVERY_OPERATOR_SEED` | repo-level, exists (64 hex chars) |
+| `COURIER_OPERATOR_SEED` | repo-level, exists (64 hex chars) |
+| `BLOSSOM_OPERATOR_SEED` | repo-level, exists (64 hex chars) |
 
 And one **variable** (not a secret) you should set:
 
 | Variable | Status |
 |---|---|
-| `DROPLET_HOST_FINGERPRINT` | **recommended** — the droplet's SSH host key fingerprint (`SHA256:...`, from `ssh-keygen -lf <(ssh-keyscan <droplet-ip>)`, recorded from a network you trust). When set, the deploy dies if the deploy-time `ssh-keyscan` returns a different key; when unset, the deploy trusts whatever key the first scan returns (TOFU) and logs a warning. |
+| `DROPLET_HOST_FINGERPRINT` | set — the droplet's SSH host key fingerprint (`SHA256:...`, from `ssh-keygen -lf <(ssh-keyscan <droplet-ip>)`, recorded from a network you trust). When set, the deploy dies if the deploy-time `ssh-keyscan` returns a different key; when unset, the deploy trusts whatever key the first scan returns (TOFU) and logs a warning. |
 
 Generate each seed with `onym-discovery keygen --out <name>.seed`; the
 secret value is the file's single 64-hex-char line. Publish the printed
@@ -203,8 +236,11 @@ the verify gate runs before a byte leaves the runner.
 CI hard-fails, with the reason, when: `policies/onym-services.md` or
 `privacy.md` is missing (they are served in both modes) or a pinned
 digest does not match their bytes; a `REPLACE-*` placeholder is still
-unfilled or the committed `reviewed/` manifests are missing (signing
-runs only — a `skip_signing` deploy reads neither, it needs the
+unfilled or the committed `reviewed/` manifests are missing, or a
+live externally hosted manifest no longer byte-matches its committed
+`reviewed/` copy — the seat was redeployed since the review, so
+re-fetch, re-read, and commit (signing
+runs only — a `skip_signing` deploy reads none of them, it needs the
 committed `signed/` tree, whose completeness is checked instead); a
 seed secret is unset (and `skip_signing` is not); or the live
 snapshot cannot be fetched — for any reason, including DNS failure —
