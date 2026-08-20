@@ -13,7 +13,8 @@
         "moderation",
         "notary",
         "transport.message",
-        "blob.storage"
+        "blob.storage",
+        "storage.backup"
       ],
       "policy": "sha256:735edc67068e9474ee177ad7e751ee1920be124b1a6fa357d8a058881450b8ac",
       "policyUri": "https://discovery.onym.app/policies/onym-services.md"
