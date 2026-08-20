@@ -63,6 +63,21 @@
       "listedAt": "2026-08-13T00:00:00Z",
       "relationship": "common-owner",
       "placement": "policy-ranked"
+    },
+    {
+      "componentId": "onym:component:onym-backup",
+      "seatType": "storage.backup",
+      "manifest": {
+        "uri": "https://backup.onym.app/manifest.json"
+      },
+      "manifestFile": "../reviewed/onym-backup.json",
+      "operator": "onym:key:d35a665d3a2126e3ede3b4fb2a591fed7904c5f837b7e86c7e81563a0078cb56",
+      "profiles": [
+        "onym:backup-implementation:object-http-v1"
+      ],
+      "listedAt": "2026-08-20T00:00:00Z",
+      "relationship": "common-owner",
+      "placement": "policy-ranked"
     }
   ]
 }
